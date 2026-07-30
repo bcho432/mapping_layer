@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pipeline lab</title>
+<style>
+  :root{
+    --ground:#F1F0F6; --surface:#FFFFFF; --surface-2:#F8F7FC;
+    --ink:#211A30; --muted:#6C6484; --faint:#9A93AE;
+    --line:#DEDBE8; --line-soft:#E9E6F1;
+    --accent:#3B4FC4; --accent-soft:#E6E8FA; --edge:#7A6FA8;
+    --stop:#B33F3A; --stop-soft:#FAE9E8;
+    --warn:#9A6714; --warn-soft:#F7EEDA;
+    --ok:#2E7D64; --ok-soft:#E4F1EC;
+    --sans:Candara,"Segoe UI",system-ui,sans-serif;
+    --mono:Consolas,"SF Mono",ui-monospace,Menlo,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#15121D; --surface:#1E1929; --surface-2:#241E33;
+      --ink:#EFECF6; --muted:#A79FBC; --faint:#7C7492;
+      --line:#332B45; --line-soft:#2A2439;
+      --accent:#97A4F7; --accent-soft:#272348; --edge:#8E82BE;
+      --stop:#F0938D; --stop-soft:#33222A;
+      --warn:#E0B461; --warn-soft:#2E2718;
+      --ok:#6FCFAC; --ok-soft:#1C2E2B;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       font-size:15px;line-height:1.5;font-variant-numeric:tabular-nums}
+  header{padding:1rem 1.4rem;border-bottom:1px solid var(--line);background:var(--surface);
+         display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;position:sticky;top:0;z-index:5}
+  header h1{margin:0;font-size:1rem;font-weight:700;letter-spacing:-.01em}
+  header .sub{font-family:var(--mono);font-size:.72rem;color:var(--faint);
+              letter-spacing:.08em;text-transform:uppercase}
+  header .grow{flex:1}
+
+  main{display:grid;grid-template-columns:22rem minmax(0,1fr);gap:1.1rem;
+       padding:1.1rem 1.4rem 4rem;align-items:start;max-width:100rem;margin:0 auto}
+  @media (max-width:66rem){ main{grid-template-columns:minmax(0,1fr)} }
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:4px;overflow:hidden}
+  .card > h2{margin:0;padding:.55rem .8rem;border-bottom:1px solid var(--line);
+             background:var(--surface-2);font-family:var(--mono);font-size:.7rem;
+             letter-spacing:.12em;text-transform:uppercase;color:var(--faint);font-weight:400;
+             display:flex;justify-content:space-between;align-items:baseline;gap:.6rem}
+  .body{padding:.85rem;display:grid;gap:.7rem}
+
+  label{display:grid;gap:.25rem;font-size:.8rem;color:var(--muted)}
+  input,select,textarea{font-family:inherit;font-size:.88rem;color:var(--ink);
+    background:var(--ground);border:1px solid var(--line);border-radius:3px;padding:.4rem .5rem;width:100%}
+  textarea{font-family:var(--mono);font-size:.74rem;line-height:1.6;resize:vertical}
+  input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible{
+    outline:2px solid var(--accent);outline-offset:1px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
+  button{font-family:inherit;font-size:.85rem;font-weight:700;cursor:pointer;
+    background:var(--accent);color:#fff;border:0;border-radius:3px;padding:.5rem .9rem}
+  button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line);font-weight:400}
+  button:disabled{opacity:.5;cursor:default}
+  :root[data-x] button{color:#fff}
+  @media (prefers-color-scheme: dark){ button{color:#15121D} }
+
+  .hint{font-size:.75rem;color:var(--faint)}
+  .pill{display:inline-block;font-family:var(--mono);font-size:.64rem;font-weight:700;
+    letter-spacing:.06em;text-transform:uppercase;padding:.1rem .35rem;border-radius:2px}
+  .pill.ok{background:var(--ok-soft);color:var(--ok)}
+  .pill.bad{background:var(--stop-soft);color:var(--stop)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .pill.idle{background:var(--surface-2);color:var(--faint);border:1px solid var(--line)}
+
+  /* pipeline */
+  .flow{display:grid;gap:.5rem}
+  .stage{border:1px solid var(--line);border-radius:4px;background:var(--surface);overflow:hidden}
+  .stage.bad{border-color:var(--stop)}
+  .stage > summary{list-style:none;cursor:pointer;padding:.55rem .8rem;display:flex;
+    align-items:center;gap:.6rem;background:var(--surface-2)}
+  .stage > summary::-webkit-details-marker{display:none}
+  .stage .n{font-family:var(--mono);font-size:.68rem;color:var(--edge);font-weight:700}
+  .stage .nm{font-family:var(--mono);font-size:.8rem;font-weight:700}
+  .stage .ms{font-family:var(--mono);font-size:.7rem;color:var(--faint);margin-left:auto}
+  .stage pre{margin:0;padding:.8rem;overflow-x:auto;font-family:var(--mono);
+    font-size:.73rem;line-height:1.6;white-space:pre;border-top:1px solid var(--line)}
+  .err{padding:.7rem .8rem;border-top:1px solid var(--line);background:var(--stop-soft);
+    color:var(--stop);font-family:var(--mono);font-size:.75rem;white-space:pre-wrap}
+
+  /* frame */
+  .scroll{overflow:auto;max-height:26rem;border-top:1px solid var(--line)}
+  table{border-collapse:collapse;width:100%;font-size:.8rem}
+  th{position:sticky;top:0;background:var(--surface-2);text-align:left;font-size:.68rem;
+    letter-spacing:.06em;text-transform:uppercase;color:var(--muted);padding:.45rem .7rem;
+    border-bottom:1px solid var(--line);white-space:nowrap;z-index:1}
+  td{padding:.35rem .7rem;border-bottom:1px solid var(--line-soft);font-family:var(--mono);
+    font-size:.76rem;white-space:nowrap}
+  td.k{color:var(--accent);font-weight:700}
+  td.null{color:var(--faint);font-style:italic}
+  tbody tr:last-child td{border-bottom:0}
+
+  .stats{display:flex;flex-wrap:wrap;gap:.45rem;padding:.7rem .8rem}
+  .stat{border:1px solid var(--line);border-radius:3px;padding:.3rem .55rem;
+    display:grid;gap:.05rem;min-width:5.5rem}
+  .stat b{font-family:var(--mono);font-size:.95rem}
+  .stat span{font-family:var(--mono);font-size:.6rem;letter-spacing:.07em;
+    text-transform:uppercase;color:var(--faint)}
+  .stat.alert b{color:var(--stop)}
+
+  .checks{display:grid;gap:.35rem;padding:.7rem .8rem}
+  .chk{display:grid;grid-template-columns:auto minmax(0,1fr);gap:.5rem;
+    align-items:baseline;font-size:.8rem}
+  .chk .t{color:var(--muted)}
+  .note{font-size:.78rem;color:var(--muted);padding:0 .8rem .8rem}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>pipeline lab</h1>
+  <span class="sub">profile-generator &rarr; spec-compiler &rarr; mapping-layer</span>
+  <span class="grow"></span>
+  <span id="selftest" class="pill idle">self-tests &hellip;</span>
+</header>
+
+<main>
+  <!-- ------------------------------------------------ controls -->
+  <div style="display:grid;gap:1.1rem">
+    <section class="card">
+      <h2>the ask</h2>
+      <div class="body">
+        <label>What do you want to know?
+          <textarea id="goal" rows="3">forecast quarterly supplier concentration by category</textarea>
+        </label>
+        <div class="row">
+          <label>Data
+            <select id="dataset"></select>
+          </label>
+          <label>Grain override
+            <select id="grain">
+              <option value="">(from the goal)</option>
+              <option>day</option><option>week</option><option>month</option>
+              <option>quarter</option><option>year</option>
+            </select>
+          </label>
+        </div>
+        <label>Frame column names
+          <select id="naming">
+            <option value="v1">v1 &mdash; series_id / t / y / x_*</option>
+            <option value="logical">logical &mdash; named after the profile</option>
+          </select>
+        </label>
+        <button id="run">Run the pipeline</button>
+        <p class="hint">Custom data: pick <em>paste your own</em> and drop CSV into the
+          box that appears.</p>
+        <label id="csvwrap" style="display:none">CSV
+          <textarea id="csv" rows="7" spellcheck="false"></textarea>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>run config <span class="pill idle">frontend only</span></h2>
+      <div class="body">
+        <div class="row">
+          <label>Engine
+            <select id="engine">
+              <option value="nixtla">nixtla</option>
+              <option value="autogluon">autogluon</option>
+            </select>
+          </label>
+          <label>Model
+            <select id="model"><option>AutoETS</option><option>AutoARIMA</option><option>auto</option></select>
+          </label>
+        </div>
+        <div class="row">
+          <label>Horizon <input id="horizon" type="number" value="4" min="1"></label>
+          <label>Season length <input id="season" type="number" value="4" min="1"></label>
+        </div>
+        <div class="row">
+          <label>Quantiles <input id="quantiles" value="0.1, 0.5, 0.9"></label>
+          <label>Backtest windows <input id="windows" type="number" value="3" min="0"></label>
+        </div>
+        <p class="hint">Nothing here is sent to a service. It is echoed back untouched so
+          you can confirm the frame is a pure function of the SPEC &mdash; change any of
+          these and re-run: every cell must be identical.</p>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>adapter compatibility</h2>
+      <div id="compat" class="checks">
+        <p class="hint" style="padding:0">Run the pipeline to check the run config against
+          the emitted SPEC.</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- ------------------------------------------------ results -->
+  <div style="display:grid;gap:1.1rem;min-width:0">
+    <section class="card">
+      <h2>the canonical frame <span id="framecount" class="pill idle">not run</span></h2>
+      <div id="stats" class="stats"></div>
+      <div id="frame" class="scroll"></div>
+      <p id="framenote" class="note"></p>
+    </section>
+
+    <section class="card">
+      <h2>stages</h2>
+      <div id="flow" class="flow" style="padding:.7rem"></div>
+    </section>
+
+    <section class="card">
+      <h2>edit &amp; re-run <span class="pill idle">optional</span></h2>
+      <div class="body">
+        <p class="hint">Edit either document and re-run from that point. Editing the SPEC
+          skips both upstream services, which is the quickest way to poke at the frame
+          directly &mdash; try adding a second key, or deleting the target.</p>
+        <label>profile <textarea id="profileEd" rows="10" spellcheck="false"></textarea></label>
+        <label>binding <textarea id="bindingEd" rows="6" spellcheck="false"></textarea></label>
+        <button class="ghost" id="rerunProfile">Re-run from the profile</button>
+        <label>SPEC <textarea id="specEd" rows="12" spellcheck="false"></textarea></label>
+        <button class="ghost" id="rerunSpec">Re-run the mapping layer only</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let DATASETS = [], LAST = null;
+
+const j = o => JSON.stringify(o, null, 2);
+const parse = (txt, what) => {
+  try { return JSON.parse(txt); }
+  catch (e) { alert(`${what} is not valid JSON:\n${e.message}`); return undefined; }
+};
+
+async function boot() {
+  DATASETS = await (await fetch('/api/datasets')).json();
+  const sel = $('dataset');
+  DATASETS.forEach(d => sel.add(new Option(d.id, d.id)));
+  sel.add(new Option('paste your own', '__custom'));
+  sel.onchange = () => {
+    $('csvwrap').style.display = sel.value === '__custom' ? 'grid' : 'none';
+  };
+  fetch('/api/selftest').then(r => r.json()).then(st => {
+    const tot = Object.values(st).reduce((a, s) => a + s.total, 0);
+    const bad = Object.values(st).reduce((a, s) => a + s.failed.length, 0);
+    const el = $('selftest');
+    el.className = 'pill ' + (bad ? 'bad' : 'ok');
+    el.textContent = bad ? `${bad} self-test failure(s)` : `self-tests ${tot}/${tot}`;
+    el.title = Object.entries(st).map(([k, v]) => `${k}: ${v.passed}/${v.total}`).join('\n');
+  }).catch(() => {});
+}
+
+function runConfig() {
+  return {
+    engine: $('engine').value,
+    model: $('model').value,
+    horizon: +$('horizon').value,
+    season_length: +$('season').value,
+    quantiles: $('quantiles').value.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n)),
+    backtest: { windows: +$('windows').value, step: 1, refit: false }
+  };
+}
+
+function payload(extra) {
+  const id = $('dataset').value;
+  const ds = DATASETS.find(d => d.id === id);
+  return Object.assign({
+    goal: $('goal').value,
+    dataset: id === '__custom' ? 'pasted' : id,
+    csv: id === '__custom' ? $('csv').value : (ds ? ds.csv : ''),
+    grain: $('grain').value,
+    naming: $('naming').value,
+    run_config: runConfig()
+  }, extra || {});
+}
+
+async function go(extra) {
+  $('run').disabled = true;
+  $('flow').innerHTML = '<p class="hint">running&hellip;</p>';
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload(extra))
+    });
+    render(await res.json());
+  } catch (e) {
+    $('flow').innerHTML = `<div class="err">${e}</div>`;
+  } finally {
+    $('run').disabled = false;
+  }
+}
+
+function render(r) {
+  LAST = r;
+  const flow = $('flow');
+  flow.innerHTML = '';
+
+  (r.stages || []).forEach((s, i) => {
+    const d = document.createElement('details');
+    d.className = 'stage' + (s.ok ? '' : ' bad');
+    d.open = !s.ok;
+    const shown = s.ok ? j(s.output) : (s.error + '\n\n' + (s.trace || []).join('\n'));
+    d.innerHTML = `<summary>
+        <span class="n">S${i + 1}</span>
+        <span class="nm">${s.title}</span>
+        <span class="pill ${s.ok ? 'ok' : 'bad'}">${s.ok ? 'ok' : 'failed'}</span>
+        <span class="ms">${s.ms} ms</span>
+      </summary>` + (s.ok ? `<pre>${esc(shown)}</pre>` : `<div class="err">${esc(shown)}</div>`);
+    flow.appendChild(d);
+  });
+
+  if (!r.ok) {
+    if (r.error) flow.innerHTML += `<div class="err">${esc(r.error)}</div>`;
+    $('frame').innerHTML = '';
+    $('stats').innerHTML = '';
+    $('framecount').className = 'pill bad';
+    $('framecount').textContent = 'no frame';
+    $('framenote').textContent =
+      'The pipeline halted. The failing stage above names what it could not do — ' +
+      'that is the intended behaviour: a gap is reported, never silently defaulted.';
+    return;
+  }
+
+  if (!$('profileEd').value || !document.activeElement.matches('textarea')) {
+    $('profileEd').value = j(r.profile);
+    $('bindingEd').value = j(r.binding);
+    $('specEd').value = j(r.spec);
+  }
+
+  drawFrame(r);
+  drawStats(r);
+  drawCompat(r);
+}
+
+function drawFrame(r) {
+  const { columns, rows } = r.frame;
+  const keys = new Set(r.frame_meta.keys || []);
+  $('framecount').className = 'pill ' + (rows.length ? 'ok' : 'warn');
+  $('framecount').textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} × ${columns.length} col`;
+  if (!rows.length) {
+    $('frame').innerHTML = '<p class="note">Empty frame — no bucket produced a measured value.</p>';
+    return;
+  }
+  const th = columns.map(c => `<th>${esc(c)}${keys.has(c) ? ' &middot; key' : ''}</th>`).join('');
+  const tr = rows.map(row => '<tr>' + columns.map(c => {
+    const v = row[c];
+    if (v === null || v === undefined) return '<td class="null">null</td>';
+    return `<td class="${keys.has(c) ? 'k' : ''}">${esc(v)}</td>`;
+  }).join('') + '</tr>').join('');
+  $('frame').innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+  $('framenote').textContent =
+    `Column names come from the SPEC (naming = ${$('naming').value}). ` +
+    `Keys: ${(r.frame_meta.keys || []).join(', ')}.`;
+}
+
+function drawStats(r) {
+  const m = r.frame_meta, d = m.rows_dropped || {};
+  const dropped = Object.values(d).reduce((a, b) => a + b, 0);
+  const items = [
+    ['rows in', r.rows_in], ['frame rows', m.frame_rows],
+    ['series', m.series_count], ['grain', m.grain || '—'],
+    ['t min', m.t_min || '—'], ['t max', m.t_max || '—'],
+    ['dropped', dropped, dropped > 0]
+  ];
+  if (m.leakage) items.push(['re-filed', m.leakage.features_refiled_forward]);
+  if (m.join) items.push(['join gaps',
+    Object.values(m.join.gaps).reduce((a, b) => a + b, 0)]);
+  $('stats').innerHTML = items.map(([k, v, alert]) =>
+    `<div class="stat${alert ? ' alert' : ''}"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join('')
+    + (dropped ? `<div class="stat alert" style="min-width:12rem"><b>${
+      esc(Object.entries(d).filter(([, n]) => n).map(([k2, n]) => `${k2}=${n}`).join(' '))
+    }</b><span>drop reasons</span></div>` : '');
+}
+
+function drawCompat(r) {
+  const cfg = runConfig(), spec = r.spec || {}, keys = spec.keys || [];
+  const binKey = keys.find(k => (k.via || '').startsWith('bin:'));
+  const grain = binKey ? binKey.via.slice(4) : null;
+  const entityKeys = keys.filter(k => !(k.via || '').startsWith('bin:'));
+  const perYear = { day: 365, week: 52, month: 12, quarter: 4, year: 1 }[grain];
+  const out = [];
+
+  const add = (ok, level, text) =>
+    out.push(`<div class="chk"><span class="pill ${level}">${ok}</span><span class="t">${text}</span></div>`);
+
+  if (!binKey) {
+    add('fail', 'bad', `horizon ${cfg.horizon} needs a time axis, but no key has a bin: derive — this SPEC has no clock to project along.`);
+  } else {
+    add('ok', 'ok', `horizon ${cfg.horizon} projects along <code>${binKey.name}</code> (${grain}).`);
+    if (perYear && cfg.season_length > perYear * 1.5) {
+      add('warn', 'warn', `season_length ${cfg.season_length} at ${grain} grain is ${(cfg.season_length / perYear).toFixed(1)} years — did you mean ${perYear}?`);
+    } else {
+      add('ok', 'ok', `season_length ${cfg.season_length} is plausible at ${grain} grain.`);
+    }
+  }
+  if (cfg.engine === 'nixtla' && entityKeys.length > 1) {
+    add('warn', 'warn', `nixtla takes a single unique_id; this SPEC has ${entityKeys.length} entity keys (${entityKeys.map(k => k.name).join(', ')}) — the adapter would have to compose them.`);
+  } else {
+    add('ok', 'ok', `${cfg.engine} accepts ${entityKeys.length} entity key${entityKeys.length === 1 ? '' : 's'}.`);
+  }
+  const ka = (spec.aggregates || []).filter(a => a.availability === 'known_ahead');
+  if (ka.length) {
+    add('n/a', 'idle', `${ka.length} known_ahead covariate(s): coverage to +${cfg.horizon} is a data question the adapter must check against real rows, not a document check.`);
+  }
+  add('note', 'idle', `Frame is unchanged by any of the above — the run config never reaches a service.`);
+  $('compat').innerHTML = out.join('');
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+$('run').onclick = () => go();
+$('rerunProfile').onclick = () => {
+  const p = parse($('profileEd').value, 'profile');
+  const b = parse($('bindingEd').value, 'binding');
+  if (p && b) go({ profile: p, binding: b });
+};
+$('rerunSpec').onclick = () => {
+  const s = parse($('specEd').value, 'SPEC');
+  if (s) go({ spec: s, profile: LAST && LAST.profile, binding: LAST && LAST.binding });
+};
+['engine', 'model', 'horizon', 'season', 'quantiles', 'windows'].forEach(
+  id => $(id).addEventListener('input', () => { if (LAST && LAST.ok) drawCompat(LAST); }));
+
+boot();
+</script>
+</body>
+</html>
