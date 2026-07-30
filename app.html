@@ -179,9 +179,14 @@
           <label>Quantiles <input id="quantiles" value="0.1, 0.5, 0.9"></label>
           <label>Backtest windows <input id="windows" type="number" value="3" min="0"></label>
         </div>
+        <label>Target column
+          <select id="target"><option value="">(run the pipeline first)</option></select>
+        </label>
+        <div id="covariates" class="hint">Everything else in the frame becomes a covariate.</div>
         <p class="hint">Nothing here is sent to a service. It is echoed back untouched so
           you can confirm the frame is a pure function of the SPEC &mdash; change any of
-          these and re-run: every cell must be identical.</p>
+          these, <strong>including the target</strong>, and re-run: every cell must be
+          identical. The SPEC aggregates; picking which column to predict happens here.</p>
       </div>
     </section>
 
@@ -252,15 +257,45 @@ async function boot() {
   }).catch(() => {});
 }
 
+function aggColumns(spec) {
+  return [].concat(
+    (spec && spec.aggregates || []).map(a => a.name),
+    (spec && spec.derives || []).map(d => d.name));
+}
+
 function runConfig() {
+  const cols = aggColumns(LAST && LAST.spec);
+  const target = $('target').value;
   return {
     engine: $('engine').value,
     model: $('model').value,
     horizon: +$('horizon').value,
     season_length: +$('season').value,
     quantiles: $('quantiles').value.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n)),
-    backtest: { windows: +$('windows').value, step: 1, refit: false }
+    backtest: { windows: +$('windows').value, step: 1, refit: false },
+    // the SPEC has no roles; this is where a column becomes the thing predicted
+    target: target || null,
+    covariates: cols.filter(c => c !== target)
   };
+}
+
+// Repopulate the target picker from the emitted SPEC, defaulting to whatever the
+// compiler says the profile intended — a suggestion the run config may override.
+function drawTarget(r) {
+  const sel = $('target'), cols = aggColumns(r.spec);
+  const hint = ((r.stages.find(s => s.id === 'compile') || {}).detail || {}).run_config_hint;
+  const wanted = sel.value && cols.includes(sel.value) ? sel.value
+    : (hint && hint.target && hint.target[0]) || cols[0] || '';
+  sel.innerHTML = '';
+  sel.add(new Option('(none — unsupervised)', ''));
+  cols.forEach(c => sel.add(new Option(c, c)));
+  sel.value = wanted;
+  const rest = cols.filter(c => c !== sel.value);
+  $('covariates').innerHTML = rest.length
+    ? `Covariates: ${rest.map(esc).join(', ')}` +
+      (hint && hint.known_ahead && hint.known_ahead.length
+        ? ` &middot; known ahead per the profile: ${hint.known_ahead.map(esc).join(', ')}` : '')
+    : 'No covariates — the frame is target-only.';
 }
 
 function payload(extra) {
@@ -331,6 +366,7 @@ function render(r) {
 
   drawFrame(r);
   drawStats(r);
+  drawTarget(r);
   drawCompat(r);
 }
 
@@ -400,9 +436,19 @@ function drawCompat(r) {
   } else {
     add('ok', 'ok', `${cfg.engine} accepts ${entityKeys.length} entity key${entityKeys.length === 1 ? '' : 's'}.`);
   }
-  const ka = (spec.aggregates || []).filter(a => a.availability === 'known_ahead');
-  if (ka.length) {
-    add('n/a', 'idle', `${ka.length} known_ahead covariate(s): coverage to +${cfg.horizon} is a data question the adapter must check against real rows, not a document check.`);
+  if (!cfg.target) {
+    add('note', 'idle', `No target selected — unsupervised. The SPEC does not care; it aggregated either way.`);
+  } else if (!aggColumns(spec).includes(cfg.target)) {
+    add('fail', 'bad', `target <code>${esc(cfg.target)}</code> is not a column in this frame.`);
+  } else {
+    add('ok', 'ok', `predicting <code>${esc(cfg.target)}</code>, ${cfg.covariates.length} covariate(s) alongside.`);
+  }
+  const anchored = (spec.aggregates || []).filter(a => a.anchor === 'arrival');
+  if (anchored.length) {
+    if (cfg.target && anchored.some(a => a.name === cfg.target)) {
+      add('warn', 'warn', `target <code>${esc(cfg.target)}</code> is anchored to arrival, so its values were re-filed forward. Labels normally anchor to the event period — check that is what you meant.`);
+    }
+    add('n/a', 'idle', `${anchored.length} arrival-anchored column(s): coverage to +${cfg.horizon} is a data question the adapter must check against real rows, not a document check.`);
   }
   add('note', 'idle', `Frame is unchanged by any of the above — the run config never reaches a service.`);
   $('compat').innerHTML = out.join('');
@@ -422,8 +468,12 @@ $('rerunSpec').onclick = () => {
   const s = parse($('specEd').value, 'SPEC');
   if (s) go({ spec: s, profile: LAST && LAST.profile, binding: LAST && LAST.binding });
 };
-['engine', 'model', 'horizon', 'season', 'quantiles', 'windows'].forEach(
-  id => $(id).addEventListener('input', () => { if (LAST && LAST.ok) drawCompat(LAST); }));
+['engine', 'model', 'horizon', 'season', 'quantiles', 'windows', 'target'].forEach(
+  id => $(id).addEventListener('input', () => {
+    if (!LAST || !LAST.ok) return;
+    if (id === 'target') drawTarget(LAST);
+    drawCompat(LAST);
+  }));
 
 boot();
 </script>

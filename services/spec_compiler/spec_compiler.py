@@ -28,6 +28,14 @@ The emitted SPEC is positioned: keys (what a row is), aggregates (the numbers),
 derives (calendar columns), filters (which rows count) and validity (when a row
 became knowable). Time is not a special slot -- it is a key with a bin: derive.
 
+WHAT THE SPEC DELIBERATELY OMITS. The profile says which metric is the target
+and which covariates are known ahead. Neither reaches the SPEC: picking a target
+is a per-run choice, and choosing differently must not move a frame cell. They
+come back as `metadata.run_config_hint`, for the run config to accept or
+override. The one part of that pair which does move data survives as
+`aggregates[].anchor` -- a covariate knowable only in arrears is anchored to its
+arrival bucket, while a label always describes its own period.
+
 Input   request.parameters.profile   the OSI profile (parsed object)
         request.parameters.binding   the physical binding (parsed object)
         request.parameters.naming    'v1' (default) keeps the frame's legacy
@@ -340,7 +348,6 @@ class SpecCompilerService(BaseService):
             yield Obligation(f"{base}.name", literal=out, origin=f"metric {mname}")
             yield Obligation(f"{base}.using", literal=fn,
                              origin=f"metric {mname}.function")
-            yield Obligation(f"{base}.role", literal=role, origin=f"metric {mname}.role")
 
             needs = entry.get("needs", [])
             for need in needs:
@@ -364,13 +371,18 @@ class SpecCompilerService(BaseService):
                 yield Obligation(f"{base}.of", logical=spare,
                                  origin=f"metric {mname}.measure")
 
-            if role == "feature":
-                avail = str(m.get("availability") or "").strip().lower() or "past_only"
-                if avail not in AVAIL:
-                    raise ValueError(
-                        f"feature '{mname}' availability must be one of {AVAIL}, got '{avail}'")
-                yield Obligation(f"{base}.availability", literal=avail,
-                                 origin=f"metric {mname}.availability")
+            # role and availability describe the modelling task, so they go to
+            # the run config, not the SPEC. What survives into the SPEC is the
+            # part that actually moves data: a covariate that is only knowable
+            # in arrears is anchored to its arrival bucket. A target is a label
+            # and always describes its own period.
+            avail = str(m.get("availability") or "").strip().lower() or "past_only"
+            if role == "feature" and avail not in AVAIL:
+                raise ValueError(
+                    f"feature '{mname}' availability must be one of {AVAIL}, got '{avail}'")
+            if role == "feature" and avail == "past_only":
+                yield Obligation(f"{base}.anchor", literal="arrival",
+                                 origin=f"metric {mname}.availability = past_only")
 
         # -- P2 filters ------------------------------------------------------
         for n, f in enumerate(profile.get("filters") or []):
@@ -402,29 +414,33 @@ class SpecCompilerService(BaseService):
     # ------------------------------------------------------------ contract
 
     @staticmethod
-    def _check(spec, kind, pad):
+    def _check(spec, kind, pad, roles):
         """Hold the emitted SPEC against the contract for this kind.
 
         A template fails loudly -- a slot you forgot to fill is a visible empty
         box. A walk fails by omission, which is quiet. This is what closes that
         gap, and it is the reason the walk is allowed to be permissive.
+
+        `roles` comes from the profile, not the SPEC: whether a question has a
+        thing to predict is a property of the question. The SPEC deliberately
+        does not record it, because which column an engine predicts is chosen
+        per run and must not move a frame cell.
         """
         rules = CONTRACT.get(kind)
         if rules is None:
             raise ValueError(f"unknown kind '{kind}' (known: {sorted(CONTRACT)})")
 
         keys = spec.get("keys") or []
-        aggs = spec.get("aggregates") or []
         entity_keys = [k for k in keys if not str(k.get("via") or "").startswith("bin:")]
         facts = {
             "time_from": bool(spec.get("time_from")),
             "time_bin": any(str(k.get("via") or "").startswith("bin:") for k in keys),
-            "targets": any(a.get("role") == "target" for a in aggs),
-            "features": any(a.get("role") == "feature" for a in aggs),
+            "targets": "target" in roles,
+            "features": "feature" in roles,
             "validity": bool((spec.get("validity") or {}).get("arrival_from")),
         }
         blame = {"time_from": "time_from", "time_bin": "keys",
-                 "targets": "aggregates", "features": "aggregates",
+                 "targets": "profile.metrics", "features": "profile.metrics",
                  "validity": "validity.arrival_from"}
         for slot, rule in rules.items():
             if slot == "keys":
@@ -540,8 +556,26 @@ class SpecCompilerService(BaseService):
             f"walk+emit: {len(pad.slots)} obligation(s) over "
             f"{len(spec.get('keys', []))} key(s), {len(spec.get('aggregates', []))} aggregate(s)")
 
+        # The profile says what the author wanted to predict; the SPEC does not
+        # carry it. Hand it over as a suggested run config so the engine side
+        # can prefill it - and so overriding it is an explicit, visible act.
+        roles, hint = [], {"target": [], "covariates": [], "known_ahead": []}
+        emitted = spec.get("aggregates") or []
+        for m, agg in zip([m for m in (profile.get("metrics") or [])
+                           if isinstance(m, dict)], emitted):
+            role = str(m.get("role") or "").strip().lower()
+            roles.append(role)
+            col = agg.get("name")
+            if role == "target":
+                hint["target"].append(col)
+            else:
+                hint["covariates"].append(col)
+                if str(m.get("availability") or "past_only").strip().lower() == "known_ahead":
+                    hint["known_ahead"].append(col)
+        report["run_config_hint"] = hint
+
         # -- stage 5: check the contract ---------------------------------
-        self._check(spec, kind, pad)
+        self._check(spec, kind, pad, roles)
         report["stages"].append(f"check: SPEC satisfies the '{kind}' contract")
         return spec, report
 
@@ -582,10 +616,16 @@ class SpecCompilerService(BaseService):
                                 SSP(key="by", type="string",
                                     description="Logical entity for share grouping (group functions like hhi)"),
                                 SSP(key="role", type="enum", required=True,
-                                    description="target = predict it; feature = carry it alongside",
+                                    description=("target = predict it; feature = carry it "
+                                                 "alongside. Authoring intent only - it does "
+                                                 "not reach the SPEC, it comes back as "
+                                                 "metadata.run_config_hint for the run config"),
                                     enum=ParameterEnum(values=list(ROLES))),
                                 SSP(key="availability", type="enum",
-                                    description="Features only: is it knowable at prediction time?",
+                                    description=("Features only: is it knowable at prediction "
+                                                 "time? Also a run-config concern, except that "
+                                                 "past_only lowers to anchor: arrival, which is "
+                                                 "the part that actually moves data"),
                                     enum=ParameterEnum(values=list(AVAIL))),
                             ]),
                         SSP(key="keys", type="array",
@@ -708,16 +748,18 @@ class SpecCompilerService(BaseService):
             "time_from": "action_dt",
             "keys": [{"name": "series_id", "from": "naics_code"},
                      {"name": "t", "via": "bin:quarter"}],
-            "aggregates": [{"name": "y", "using": "hhi", "role": "target",
+            "aggregates": [{"name": "y", "using": "hhi",
                             "of": "dollars_obligated", "by": "recipient_parent"}],
         }
         checks["compiled SPEC matches the design doc"] = spec == expected
+        checks["the target is named by the run config, not the SPEC"] = (
+            report["run_config_hint"]["target"] == ["y"])
 
         # the crosswalk is generated, so it covers the document by construction
         emitted = set()
         for path in ("time_from", "keys[0].name", "keys[0].from", "keys[1].name",
                      "keys[1].via", "aggregates[0].name", "aggregates[0].using",
-                     "aggregates[0].role", "aggregates[0].of", "aggregates[0].by"):
+                     "aggregates[0].of", "aggregates[0].by"):
             emitted.add(path)
         checks["crosswalk covers every emitted path"] = (
             {c["spec"].split(" = ")[0] for c in report["crosswalk"]} == emitted)
@@ -756,10 +798,26 @@ class SpecCompilerService(BaseService):
             aggs2[0]["name"] == "revenue" and aggs2[1]["name"] == "units")
         checks["feature lowered with binding"] = (
             aggs2[2]["name"] == "x_promo" and aggs2[2]["of"] == "promo_flag")
-        checks["feature availability copied"] = aggs2[2]["availability"] == "known_ahead"
-        checks["roles reach the spec"] = (
-            [a["role"] for a in aggs2] == ["target", "target", "feature"])
+        checks["no role reaches the spec"] = not any("role" in a for a in aggs2)
+        checks["no availability reaches the spec"] = not any("availability" in a for a in aggs2)
+        checks["known_ahead needs no anchor"] = "anchor" not in aggs2[2]
+        checks["roles surface as a run-config hint instead"] = (
+            report2["run_config_hint"] == {"target": ["revenue", "units"],
+                                           "covariates": ["x_promo"],
+                                           "known_ahead": ["x_promo"]})
         checks["list indices densify past the role split"] = len(aggs2) == 3
+
+        # a past_only covariate is the one role/availability case that moves
+        # data, and it survives as an anchor rather than as a role
+        prof_po = {**prof2, "metrics": [
+            prof2["metrics"][0],
+            {**prof2["metrics"][2], "availability": "past_only"}]}
+        spec_po, rep_po = self._compile(prof_po, bind2)
+        checks["past_only lowers to anchor: arrival"] = (
+            spec_po["aggregates"][1]["anchor"] == "arrival"
+            and "anchor" not in spec_po["aggregates"][0])
+        checks["past_only is not in the known_ahead hint"] = (
+            rep_po["run_config_hint"]["known_ahead"] == [])
 
         # ---- available_from flows through from the binding ----
         bind3 = {**bind2, "available_from": "reported_dt"}
@@ -829,8 +887,10 @@ class SpecCompilerService(BaseService):
             checks["regress emits no time_from"] = (
                 "time_from" not in kinds["regress: no clock at all"])
         if kinds["cluster: no target at all"]:
-            checks["cluster emits only features"] = all(
-                a["role"] == "feature"
+            # nothing in the SPEC says these are features - the contract checked
+            # the profile, and the run config will name no target
+            checks["cluster emits aggregates with no role"] = all(
+                "role" not in a
                 for a in kinds["cluster: no target at all"]["aggregates"])
         if kinds["recommend: two keys"]:
             checks["recommend emits two entity keys"] = (

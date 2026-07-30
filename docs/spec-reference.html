@@ -1,0 +1,672 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The SPEC — a field reference</title>
+<style>
+  :root{
+    --ground:#F1F0F6; --surface:#FFFFFF; --surface-2:#F8F7FC;
+    --ink:#211A30; --muted:#655D7E; --faint:#948CAA;
+    --line:#DEDBE8; --line-soft:#EAE7F2;
+    --accent:#3B4FC4; --accent-soft:#E6E8FA; --edge:#7A6FA8;
+    --mark:#EAF25E; --mark-ink:#211A30;
+    --stop:#B33F3A; --stop-soft:#FAE9E8;
+    --ok:#2E7D64; --ok-soft:#E4F1EC;
+    --serif:"Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;
+    --sans:Candara,"Segoe UI",system-ui,-apple-system,sans-serif;
+    --mono:Consolas,"SF Mono",ui-monospace,Menlo,monospace;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ground:#15121D; --surface:#1E1929; --surface-2:#241E33;
+      --ink:#EFECF6; --muted:#ABA3C0; --faint:#7C7492;
+      --line:#332B45; --line-soft:#2A2439;
+      --accent:#97A4F7; --accent-soft:#272348; --edge:#8E82BE;
+      --mark:#D9E44A; --mark-ink:#1A1626;
+      --stop:#F0938D; --stop-soft:#33222A;
+      --ok:#6FCFAC; --ok-soft:#1C2E2B;
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--ground);color:var(--ink);
+    font-family:var(--sans);font-size:18px;line-height:1.68;
+    font-variant-numeric:tabular-nums;-webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:56rem;margin:0 auto;padding:0 1.6rem 7rem}
+  p,ul,ol{max-width:38rem}
+  p{text-wrap:pretty;margin:0 0 1rem}
+
+  header.top{padding:4rem 0 0}
+  h1{font-family:var(--serif);font-weight:400;font-size:clamp(2.1rem,5vw,3rem);
+     line-height:1.08;letter-spacing:-.015em;margin:0 0 .8rem;text-wrap:balance}
+  .standfirst{font-size:1.15rem;color:var(--muted);max-width:38rem}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--faint);margin:0 0 .9rem}
+
+  h2{font-family:var(--serif);font-weight:400;font-size:clamp(1.5rem,3.2vw,2rem);
+     line-height:1.2;letter-spacing:-.01em;margin:0 0 .3rem;text-wrap:balance}
+  h3{font-size:1.05rem;font-weight:700;margin:2rem 0 .5rem;letter-spacing:-.005em}
+  h3 code{font-size:1em;background:none;padding:0;color:var(--accent)}
+  section{padding-top:3.5rem}
+  section+section{border-top:1px solid var(--line-soft);margin-top:3.5rem}
+  .lede{color:var(--muted);font-size:1.05rem;margin-bottom:1.6rem}
+
+  code{font-family:var(--mono);font-size:.85em;background:var(--surface-2);
+       padding:.1em .32em;border-radius:3px}
+  pre{margin:0 0 1.2rem;font-family:var(--mono);font-size:.8rem;line-height:1.75;
+      white-space:pre;overflow-x:auto;background:var(--surface);
+      border:1px solid var(--line);border-radius:4px;padding:1rem 1.1rem}
+  pre code{background:none;padding:0;font-size:1em}
+  .dim{color:var(--faint)}
+  .hot{color:var(--accent)}
+  .bad{color:var(--stop)}
+  .good{color:var(--ok)}
+
+  .mark{background-image:linear-gradient(var(--mark),var(--mark));
+    background-repeat:no-repeat;background-position:0 50%;background-size:100% 1.15em;
+    color:var(--mark-ink);padding:0 .12em;
+    box-decoration-break:clone;-webkit-box-decoration-break:clone}
+
+  /* field lists */
+  dl.fields{margin:0 0 1.4rem;display:grid;grid-template-columns:auto minmax(0,1fr);
+    gap:.1rem 1.3rem;align-items:baseline;max-width:44rem}
+  dl.fields dt{font-family:var(--mono);font-size:.82rem;font-weight:700;
+    color:var(--accent);white-space:nowrap;padding-top:.35rem}
+  dl.fields dt .req{color:var(--stop);font-weight:700}
+  dl.fields dt .opt{color:var(--faint);font-weight:400}
+  dl.fields dd{margin:0;padding:.3rem 0;font-size:.94rem;color:var(--muted);
+    border-bottom:1px solid var(--line-soft)}
+  dl.fields dd:last-of-type{border-bottom:0}
+  dl.fields dd b{color:var(--ink);font-weight:400}
+
+  table{border-collapse:collapse;width:100%;font-size:.88rem;margin:0 0 1.3rem}
+  .tw{overflow-x:auto;border:1px solid var(--line);border-radius:4px;background:var(--surface)}
+  th{text-align:left;font-size:.7rem;letter-spacing:.07em;text-transform:uppercase;
+     color:var(--muted);padding:.55rem .85rem;border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:.5rem .85rem;border-bottom:1px solid var(--line-soft);vertical-align:top}
+  tbody tr:last-child td{border-bottom:0}
+  td.m,th.m{font-family:var(--mono);font-size:.8rem}
+
+  .note{background:var(--surface);border:1px solid var(--line);
+    border-left:3px solid var(--edge);border-radius:4px;padding:1rem 1.15rem;
+    margin:0 0 1.3rem;max-width:44rem}
+  .note.warn{border-left-color:var(--stop)}
+  .note.good{border-left-color:var(--ok)}
+  .note p{margin:0}
+  .note p+p{margin-top:.6rem}
+  .note b.tag{display:block;font-family:var(--mono);font-size:.66rem;letter-spacing:.11em;
+    text-transform:uppercase;color:var(--edge);margin-bottom:.3rem}
+  .note.warn b.tag{color:var(--stop)}
+  .note.good b.tag{color:var(--ok)}
+
+  nav.toc{background:var(--surface);border:1px solid var(--line);border-radius:4px;
+    padding:1rem 1.2rem;margin:2.5rem 0 0;max-width:38rem}
+  nav.toc p{font-family:var(--mono);font-size:.68rem;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--faint);margin:0 0 .5rem}
+  nav.toc ol{margin:0;padding-left:1.3rem;font-size:.95rem}
+  nav.toc li{margin:.15rem 0}
+  a{color:var(--accent)}
+  a:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+
+  footer{margin-top:4rem;padding-top:1.3rem;border-top:1px solid var(--line-soft);
+    font-family:var(--mono);font-size:.74rem;color:var(--faint);line-height:1.9}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <p class="eyebrow">decision engine &middot; field reference</p>
+  <h1>The SPEC</h1>
+  <p class="standfirst">Everything the mapping layer needs to turn raw rows into a
+  canonical frame &mdash; and, just as important, everything it deliberately
+  refuses to carry.</p>
+
+  <nav class="toc">
+    <p>contents</p>
+    <ol>
+      <li><a href="#shape">The shape, at a glance</a></li>
+      <li><a href="#example">One complete example</a></li>
+      <li><a href="#keys">keys &mdash; what a row is</a></li>
+      <li><a href="#aggregates">aggregates &mdash; the numbers</a></li>
+      <li><a href="#anchor">anchor &mdash; which bucket a value belongs to</a></li>
+      <li><a href="#derives">derives &mdash; calendar columns</a></li>
+      <li><a href="#filters">filters &mdash; which rows count</a></li>
+      <li><a href="#validity">validity &mdash; the leakage guard</a></li>
+      <li><a href="#sources">Multiple sources</a></li>
+      <li><a href="#catalogs">The catalogs</a></li>
+      <li><a href="#not">What the SPEC does not contain</a></li>
+      <li><a href="#runconfig">The run config</a></li>
+      <li><a href="#v1">Coming from a v1 SPEC</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- ===================================================== -->
+<section id="shape">
+  <h2>The shape, at a glance</h2>
+  <p class="lede">Five slots. Only <code>keys</code> and <code>aggregates</code> are
+  required.</p>
+
+<pre><code>{
+  <span class="hot">"keys"</span>:       [ … ],   <span class="dim">// what identifies one output row</span>
+  <span class="hot">"aggregates"</span>: [ … ],   <span class="dim">// the numbers in that row</span>
+  <span class="hot">"derives"</span>:    [ … ],   <span class="dim">// calendar columns off a binned key</span>
+  <span class="hot">"filters"</span>:    [ … ],   <span class="dim">// which raw rows count at all</span>
+  <span class="hot">"validity"</span>:   { … },   <span class="dim">// when a row became knowable</span>
+
+  <span class="dim">// plus, when the clock or the inputs need naming:</span>
+  "time_from":   "…",     <span class="dim">// the column a bin: key reads</span>
+  "sources":     [ … ],   <span class="dim">// several inputs, joined on the clock</span>
+  "source_from": "…"      <span class="dim">// the column tagging each row's source</span>
+}</code></pre>
+
+  <p>Every column in the output frame is declared here by name. Nothing is implied,
+  nothing is prefixed automatically, and there is no reserved column.</p>
+
+  <div class="note">
+    <p><b class="tag">the one rule worth internalising</b>
+    A field belongs in the SPEC if changing it changes the frame. Grain, keys,
+    functions and anchors all move cells, so they live here. Horizon, season
+    length, engine and <em>which column you predict</em> move nothing, so they
+    live in the run config.</p>
+  </div>
+</section>
+
+<!-- ===================================================== -->
+<section id="example">
+  <h2>One complete example</h2>
+  <p class="lede">Supplier concentration by category, quarterly, with a leakage
+  guard. This is real output from <code>datasets/awards.csv</code>.</p>
+
+<pre><code>{
+  "time_from": "action_date",
+  "validity": { "arrival_from": "reported_dt" },
+
+  "keys": [
+    { "name": "category", "from": "product_category" },
+    { "name": "period",   "via":  "bin:quarter" }
+  ],
+
+  "aggregates": [
+    { "name": "spend", "using": "sum", "of": "dollars_obligated" },
+    { "name": "hhi",   "using": "hhi", "of": "dollars_obligated",
+      "by": "recipient_parent", "anchor": "arrival" }
+  ],
+
+  "derives": [
+    { "name": "q", "scope": "key", "from": "period", "via": "quarter_of_year" }
+  ]
+}</code></pre>
+
+<pre><code><span class="dim">category      period    spend         hhi           q</span>
+aerospace     2024-Q1   100000000.0   4600.0        1
+aerospace     2024-Q2   104000000.0   4016.272189   2
+aerospace     2024-Q3   102000000.0   6388.021737   3
+aerospace     2024-Q4   <span class="bad">null</span>          10000.0       4
+it_services   2024-Q1    20000000.0   2500.0        1
+…</code></pre>
+
+  <p>Read the column order straight off the SPEC: keys first, then aggregates, then
+  derives, each under the <code>name</code> you gave it.</p>
+
+  <p>That <code>2024-Q4</code> row is the interesting one. There is no Q4 spend,
+  because no award happened in Q4. The row exists because one September award was
+  not <em>reported</em> until 30 October, and <code>hhi</code> is anchored to
+  arrival &mdash; so its value was re-filed forward into the quarter where a
+  forecaster would first have had it. <a href="#anchor">More on that below.</a></p>
+</section>
+
+<!-- ===================================================== -->
+<section id="keys">
+  <h2><code>keys</code> — what a row is</h2>
+  <p class="lede">Rows sharing the same key values are aggregated together. This is
+  the GROUP BY. Order matters twice: it is the composite-key order and the frame's
+  sort order.</p>
+
+  <dl class="fields">
+    <dt>name <span class="req">*</span></dt>
+    <dd>The output column name for this key.</dd>
+    <dt>from</dt>
+    <dd>The column to read. <b>Omit only on a <code>bin:</code> key</b>, which then
+      bins whichever column each source declared as its clock.</dd>
+    <dt>via</dt>
+    <dd>A derive applied <b>before</b> grouping. A <code>bin:</code> derive turns a
+      date into a time bucket.</dd>
+    <dt>prefix</dt>
+    <dd>Prepended to this key's values. <code>"store_"</code> turns <code>12</code>
+      into <code>store_12</code>.</dd>
+    <dt>aliases</dt>
+    <dd>Rewrite raw values before grouping — merging subsidiaries under a parent,
+      say. A list of <code>{value, replace_with}</code>.</dd>
+  </dl>
+
+<pre><code><span class="dim">// a plain key — one row per customer</span>
+{ "name": "customer", "from": "cust_id" }
+
+<span class="dim">// a time key — this is how a clock enters a frame</span>
+{ "name": "period", "via": "bin:quarter" }
+
+<span class="dim">// two plain keys — a recommendation grid</span>
+{ "name": "customer", "from": "cust_id" },
+{ "name": "item",     "from": "item_sku" }</code></pre>
+
+  <div class="note">
+    <p><b class="tag">time is not a special slot</b>
+    There is no <code>time_grain</code> field. A clock is just a key with a
+    <code>bin:</code> derive, which is why a frame can have two keys, or five, or
+    none that are temporal at all. A cross-sectional question simply has no
+    <code>bin:</code> key — and then <code>time_from</code> is not required either.</p>
+  </div>
+</section>
+
+<!-- ===================================================== -->
+<section id="aggregates">
+  <h2><code>aggregates</code> — the numbers</h2>
+  <p class="lede">One entry per output column that is not a key.</p>
+
+  <dl class="fields">
+    <dt>name <span class="req">*</span></dt>
+    <dd>The output column name. Must not collide with a key.</dd>
+    <dt>using <span class="req">*</span></dt>
+    <dd>A function from the catalog, applied within each key bucket.</dd>
+    <dt>of</dt>
+    <dd>The measure column the function reads. Required whenever the catalog row
+      says <code>needs: measure</code>; omitted for <code>count</code>.</dd>
+    <dt>by</dt>
+    <dd>The entity column to form shares over. Required when the catalog row says
+      <code>needs: entity</code> — today that means <code>hhi</code> and
+      <code>top_share</code>.</dd>
+    <dt>anchor</dt>
+    <dd><code>event</code> (default) or <code>arrival</code>. <a href="#anchor">See
+      below.</a></dd>
+    <dt>source</dt>
+    <dd>Only with multiple sources, and only when the function reads no column
+      (a bare <code>count</code>) so the source cannot be inferred.</dd>
+  </dl>
+
+<pre><code><span class="dim">// a simple sum</span>
+{ "name": "revenue", "using": "sum", "of": "amount" }
+
+<span class="dim">// count needs no measure at all</span>
+{ "name": "orders", "using": "count" }
+
+<span class="dim">// a group function totals per entity first, then reduces</span>
+{ "name": "concentration", "using": "hhi",
+  "of": "dollars_obligated", "by": "recipient_parent" }</code></pre>
+
+  <p>A row reaches the frame when <strong>at least one</strong> aggregate produced a
+  value. A bucket where everything is null is dropped; a bucket with one live
+  number and three nulls is kept, with nulls in the frame.</p>
+
+  <div class="note good">
+    <p><b class="tag">no roles here</b>
+    There is no <code>target</code> or <code>feature</code>. Which column an engine
+    predicts is a per-run decision, and choosing differently must not move a frame
+    cell — so it lives in the run config. A SPEC that carries <code>role</code> or
+    <code>availability</code> is rejected, with a message pointing at the right
+    home.</p>
+  </div>
+</section>
+
+<!-- ===================================================== -->
+<section id="anchor">
+  <h2><code>anchor</code> — which bucket a value belongs to</h2>
+  <p class="lede">The subtle one, and the only place a per-column setting quietly
+  changes where data lands.</p>
+
+  <p>Two timestamps matter for any fact: when the thing <em>happened</em>, and when
+  you <em>found out</em>. Anchor says which of those a column is filed under.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th class="m">anchor</th><th>means</th><th>use for</th></tr></thead>
+    <tbody>
+      <tr><td class="m">event<br><span class="dim">(default)</span></td>
+          <td>The value describes that period, whenever it arrived.</td>
+          <td>Labels — Q1 sales were Q1 sales. Also anything already knowable at
+            the time.</td></tr>
+      <tr><td class="m">arrival</td>
+          <td>The value belongs to the bucket where it became knowable. If that
+            is later than the event bucket, it is <b>re-filed forward</b>.</td>
+          <td>Covariates you only learn in arrears, where using them earlier
+            would be looking into the future.</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Anchor only bites when <a href="#validity"><code>validity.arrival_from</code></a>
+  is set. Without an arrival column there is nothing to compare against, and
+  everything files by event time.</p>
+
+  <div class="note warn">
+    <p><b class="tag">why this matters more than it looks</b>
+    Getting it wrong produces lookahead bias, which does not crash and does not
+    warn — it makes backtests look <em>better</em>. Nobody investigates a model
+    that validates well. It surfaces months later as a production model that has
+    never once matched its evaluation.</p>
+  </div>
+
+  <p>Because anchor is per column rather than per role, you can aggregate the same
+  measure twice and get both views in a single pass:</p>
+
+<pre><code>{ "name": "as_happened", "using": "max", "of": "promo", "anchor": "event"   },
+{ "name": "as_known",    "using": "max", "of": "promo", "anchor": "arrival" }</code></pre>
+
+  <p>A promo dated 20 July but not knowable until 5 September lands in
+  <code>as_happened</code> for July and in <code>as_known</code> for September.
+  The count of moved values is reported as
+  <code>metadata.leakage.features_refiled_forward</code>.</p>
+</section>
+
+<!-- ===================================================== -->
+<section id="derives">
+  <h2><code>derives</code> — calendar columns</h2>
+  <p class="lede">Computed from a binned key, not from the rows. Always defined, so
+  they never decide whether a row is emitted.</p>
+
+  <dl class="fields">
+    <dt>name <span class="req">*</span></dt><dd>The output column name.</dd>
+    <dt>via <span class="req">*</span></dt><dd>A derive from the catalog.</dd>
+    <dt>scope</dt>
+    <dd><code>key</code> (default) — runs once per output row.
+      <code>row</code> is catalogued but <b>not built yet</b>; asking for one
+      tells you so.</dd>
+    <dt>from</dt>
+    <dd>Which binned key to read. Defaults to the time key.</dd>
+  </dl>
+
+<pre><code>{ "name": "q", "scope": "key", "from": "period", "via": "quarter_of_year" }</code></pre>
+</section>
+
+<!-- ===================================================== -->
+<section id="filters">
+  <h2><code>filters</code> — which rows count</h2>
+  <p class="lede">Row-level predicates, ANDed together.</p>
+
+  <dl class="fields">
+    <dt>of <span class="req">*</span></dt><dd>The column to test.</dd>
+    <dt>using</dt>
+    <dd>One of <code>equals</code>, <code>notEquals</code>,
+      <code>greaterThan</code>, <code>lessThan</code>, <code>contains</code>,
+      <code>isEmpty</code>, <code>isNotEmpty</code>. Defaults to
+      <code>equals</code>.</dd>
+    <dt>value</dt><dd>The comparand. Unused for the two emptiness tests.</dd>
+    <dt>applied_upstream</dt>
+    <dd><code>true</code> means a database already ran this predicate: keep it
+      declared, do not re-run it.</dd>
+  </dl>
+
+<pre><code>{ "of": "awarding_agency", "using": "equals",      "value": "DoD"   },
+{ "of": "dollars_obligated", "using": "greaterThan", "value": 25000 },
+{ "of": "cancelled_dt",    "using": "isEmpty" }</code></pre>
+
+  <p>Predicates should be declared here even when a database executes them. The SPEC
+  is the reviewed artefact — a scoping decision that changes the numbers has to stay
+  visible in it, and <code>applied_upstream</code> is how you get pushdown without
+  losing that.</p>
+
+  <div class="note warn">
+    <p><b class="tag">known defect</b>
+    <code>greaterThan</code> and <code>lessThan</code> compare numerically. A date
+    comparand does not parse as a number, so a <b>date-range filter silently matches
+    nothing</b>. Filter dates with a bin: key or upstream until the operator catalog
+    carries an operand type.</p>
+  </div>
+</section>
+
+<!-- ===================================================== -->
+<section id="validity">
+  <h2><code>validity</code> — the leakage guard</h2>
+  <p class="lede">Declares which column says when a row became knowable, as distinct
+  from when the thing it describes happened.</p>
+
+  <dl class="fields">
+    <dt>arrival_from</dt>
+    <dd>The arrival-timestamp column. Enables <code>anchor: "arrival"</code>; without
+      it, anchor has nothing to compare against and does nothing.</dd>
+  </dl>
+
+<pre><code>"validity": { "arrival_from": "reported_dt" }</code></pre>
+
+  <p>Worked through, at quarterly grain:</p>
+
+<pre><code>a shipment happened      2024-02-14   <span class="dim">→ event bucket   2024-Q1</span>
+it was reported          2024-04-08   <span class="dim">→ arrival bucket 2024-Q2</span>
+
+anchor: "event"    <span class="dim">→</span> lands in <span class="good">2024-Q1</span>
+anchor: "arrival"  <span class="dim">→</span> lands in <span class="good">2024-Q2</span>   <span class="dim">re-filed; Q1 never sees it</span></code></pre>
+
+  <div class="note">
+    <p><b class="tag">why this cannot live anywhere else</b>
+    The decision needs both timestamps for an individual row, at the moment it is
+    placed in a group. After aggregation the bucket holds a number and the per-row
+    provenance is gone — no later stage can reconstruct it. A plain join upstream
+    destroys it in the other direction, attaching a value to a row that predates
+    knowing it. This is the reason the mapping layer exists instead of a GROUP BY.</p>
+  </div>
+</section>
+
+<!-- ===================================================== -->
+<section id="sources">
+  <h2>Multiple sources</h2>
+  <p class="lede">Optional. With one input you can skip this section entirely and
+  just set <code>time_from</code>.</p>
+
+  <dl class="fields">
+    <dt>time_from</dt>
+    <dd>The clock column, for a single source or as the default for sources without
+      their own. Required only if some key uses a <code>bin:</code> derive.</dd>
+    <dt>sources[].id <span class="req">*</span></dt>
+    <dd>The source's id, used to qualify columns as
+      <code>&lt;source&gt;.&lt;column&gt;</code>.</dd>
+    <dt>sources[].time_from</dt><dd>That source's own clock column.</dd>
+    <dt>sources[].available_from</dt><dd>That source's own arrival column.</dd>
+    <dt>source_from</dt>
+    <dd>The column tagging each raw row with its source id. Required as soon as
+      there is more than one source.</dd>
+  </dl>
+
+<pre><code>"source_from": "src",
+"sources": [
+  { "id": "power",   "time_from": "period" },
+  { "id": "weather", "time_from": "time"   }
+],
+"aggregates": [
+  { "name": "y_power", "using": "mean", "of": "power.value_MWh"    },
+  { "name": "y_temp",  "using": "mean", "of": "weather.temperature_c" }
+]</code></pre>
+
+  <p>Sources are aligned on the shared time bucket. Where one source cannot supply a
+  key — weather has no <code>respondent</code> column, say — its values broadcast
+  onto every row that agrees on the keys it can supply. A bucket with no matching
+  partner emits <code>null</code> rather than disappearing, and the count is reported
+  as <code>metadata.join.gaps</code>.</p>
+</section>
+
+<!-- ===================================================== -->
+<section id="catalogs">
+  <h2>The catalogs</h2>
+  <p class="lede">Both are data files with an identical embedded fallback, so a name
+  is never guessed and never silently defaulted.</p>
+
+  <h3>Functions <span class="dim" style="font-weight:400;font-size:.85rem">— function_library</span></h3>
+  <div class="tw"><table>
+    <thead><tr><th class="m">using</th><th>shelf</th><th class="m">needs</th><th>what it does</th></tr></thead>
+    <tbody>
+      <tr><td class="m">sum</td><td>core</td><td class="m">measure</td><td>Add a measure up</td></tr>
+      <tr><td class="m">mean</td><td>core</td><td class="m">measure</td><td>Average a measure</td></tr>
+      <tr><td class="m">min</td><td>core</td><td class="m">measure</td><td>Smallest value</td></tr>
+      <tr><td class="m">max</td><td>core</td><td class="m">measure</td><td>Largest value</td></tr>
+      <tr><td class="m">first</td><td>core</td><td class="m">measure</td><td>First value, by input order</td></tr>
+      <tr><td class="m">last</td><td>core</td><td class="m">measure</td><td>Last value, by input order</td></tr>
+      <tr><td class="m">count</td><td>core</td><td class="m dim">—</td><td>Count the rows in the bucket</td></tr>
+      <tr><td class="m">hhi</td><td>supply-chain</td><td class="m">measure, entity</td>
+          <td>Herfindahl-Hirschman index: sum of squared percent shares</td></tr>
+      <tr><td class="m">top_share</td><td>supply-chain</td><td class="m">measure, entity</td>
+          <td>Largest single entity's percent share</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The <code>needs</code> column is not documentation — it is what generates the
+  SPEC's fields. Adding a catalog row with a new need adds a new field to the
+  aggregate, with no change to the compiler's branching.</p>
+
+  <p>A group function does two passes inside one bucket: it totals <code>of</code>
+  per distinct value of <code>by</code>, then reduces those entity totals to one
+  number. That is why HHI nets deobligations per vendor before computing shares.</p>
+
+  <h3>Derives <span class="dim" style="font-weight:400;font-size:.85rem">— derive_library</span></h3>
+  <div class="tw"><table>
+    <thead><tr><th class="m">via</th><th>returns</th><th>what it does</th></tr></thead>
+    <tbody>
+      <tr><td class="m">bin:day</td><td>bucket</td><td>One calendar day</td></tr>
+      <tr><td class="m">bin:week</td><td>bucket</td><td>One ISO week</td></tr>
+      <tr><td class="m">bin:month</td><td>bucket</td><td>One calendar month</td></tr>
+      <tr><td class="m">bin:quarter</td><td>bucket</td><td>One calendar quarter</td></tr>
+      <tr><td class="m">bin:year</td><td>bucket</td><td>One calendar year</td></tr>
+      <tr><td class="m">week_of_year</td><td>scalar</td><td>ISO week number of the bucket</td></tr>
+      <tr><td class="m">month_of_year</td><td>scalar</td><td>Calendar month number</td></tr>
+      <tr><td class="m">quarter_of_year</td><td>scalar</td><td>Calendar quarter number</td></tr>
+      <tr><td class="m">day_of_week</td><td>scalar</td><td>ISO weekday, Monday is 1</td></tr>
+      <tr><td class="m">year</td><td>scalar</td><td>Calendar year</td></tr>
+    </tbody>
+  </table></div>
+
+  <p><b>bucket</b> derives go on a key and return a label plus a sort value.
+  <b>scalar</b> derives go in <code>derives[]</code> and read a bucket. Ask for a
+  name that is not here and you get an error listing everything that is — never a
+  default.</p>
+</section>
+
+<!-- ===================================================== -->
+<section id="not">
+  <h2>What the SPEC does not contain</h2>
+  <p class="lede">Apply the test: change it, does the frame change? If no, it does
+  not belong here.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th class="m">not in the SPEC</th><th>why</th><th>lives in</th></tr></thead>
+    <tbody>
+      <tr><td class="m">role</td>
+          <td>Which column is predicted is a per-run choice. Same frame either way.</td>
+          <td>run config</td></tr>
+      <tr><td class="m">availability</td>
+          <td>Whether a covariate is usable for future rows. Once <code>anchor</code>
+            exists, this moves no cells.</td>
+          <td>run config</td></tr>
+      <tr><td class="m">horizon</td>
+          <td>How far ahead to predict. The frame is history; the adapter builds the
+            future scaffold.</td>
+          <td>run config</td></tr>
+      <tr><td class="m">season_length,<br>quantiles, model</td>
+          <td>Fit parameters. They never touch a row.</td>
+          <td>run config</td></tr>
+      <tr><td class="m">column naming</td>
+          <td><code>unique_id</code>/<code>ds</code> for Nixtla,
+            <code>item_id</code>/<code>timestamp</code> for AutoGluon — same numbers,
+            different labels.</td>
+          <td>engine dialect</td></tr>
+      <tr><td class="m">kind</td>
+          <td>forecast, cluster, regress… Needed to validate that a question is
+            coherent, but not to build the frame.</td>
+          <td>profile</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>The payoff is worth stating plainly: <span class="mark">the frame is a pure
+  function of the SPEC.</span> Twenty runs sweeping horizon, season and model read
+  one cached frame. Two engines compared over one frame saw identical numbers, so
+  the comparison is honest.</p>
+</section>
+
+<!-- ===================================================== -->
+<section id="runconfig">
+  <h2>The run config</h2>
+  <p class="lede">Everything that configures the engine call and touches nothing in
+  the frame. It never reaches the compiler or the mapping layer.</p>
+
+  <div class="note warn">
+    <p><b class="tag">status</b>
+    Not built as a service yet. It exists in the pipeline lab as a browser-side
+    panel that is echoed back untouched, which is how you verify the purity claim
+    above. The shape below is the intent, not a shipped contract.</p>
+  </div>
+
+<pre><code>{
+  "engine":        "nixtla",          <span class="dim">// selects the dialect</span>
+  "model":         "AutoETS",
+  "target":        "concentration",   <span class="dim">// which aggregate to predict</span>
+  "covariates":    ["x_promo"],       <span class="dim">// default: everything else</span>
+  "known_ahead":   ["x_promo"],       <span class="dim">// usable for future rows</span>
+  "horizon":       8,
+  "season_length": 4,
+  "quantiles":     [0.1, 0.5, 0.9],
+  "backtest":      { "windows": 3, "step": 1, "refit": false },
+  "metrics":       ["mase", "smape"],
+  "seed":          42
+}</code></pre>
+
+  <p>The compiler does not emit this, but it does report a suggestion. A profile says
+  which metric was <em>meant</em> to be the target; that comes back as
+  <code>metadata.run_config_hint</code> with <code>target</code>,
+  <code>covariates</code> and <code>known_ahead</code>, for the engine side to
+  prefill. Overriding it is then an explicit act that recompiles nothing.</p>
+
+  <p>Some run configs are nonsense against some SPECs, and the adapter is where that
+  gets caught: a season length of 52 against a quarterly grain, a horizon with no
+  <code>bin:</code> key to project along, two entity keys against an engine that
+  takes one series id. One check has to look at data rather than documents —
+  whether a <code>known_ahead</code> covariate actually extends far enough forward
+  to cover the horizon.</p>
+</section>
+
+<!-- ===================================================== -->
+<section id="v1">
+  <h2>Coming from a v1 SPEC</h2>
+  <p class="lede">Old specs still run, untranslated by you. The mapping layer converts
+  them on the way in, which is why v1's column names are simply what the translation
+  writes.</p>
+
+  <div class="tw"><table>
+    <thead><tr><th class="m">v1</th><th class="m">now</th></tr></thead>
+    <tbody>
+      <tr><td class="m">series_from: "store"</td>
+          <td class="m">keys: [{ name: "series_id", from: "store" }]</td></tr>
+      <tr><td class="m">time_grain: "week"</td>
+          <td class="m">keys: [{ name: "t", via: "bin:week" }]</td></tr>
+      <tr><td class="m">series_prefix / series_aliases</td>
+          <td class="m">prefix / aliases on that key</td></tr>
+      <tr><td class="m">targets: [{ fn, measure, entity }]</td>
+          <td class="m">aggregates: [{ using, of, by }]</td></tr>
+      <tr><td class="m">features: [{ … }]</td>
+          <td class="m">aggregates, plus derives for the calendar ones</td></tr>
+      <tr><td class="m">availability: "past_only"</td>
+          <td class="m">anchor: "arrival"</td></tr>
+      <tr><td class="m">availability: "known_ahead"</td>
+          <td class="m">anchor: "event" (the default — omit it)</td></tr>
+      <tr><td class="m">role: target / feature</td>
+          <td class="m">gone — the run config picks the target</td></tr>
+      <tr><td class="m">filters[].column / .operator</td>
+          <td class="m">filters[].of / .using</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>Two differences to expect. A v1 spec still gets the old
+  <code>metadata.targets</code> and <code>metadata.features</code> lists; a v2 spec
+  gets a single <code>metadata.aggregates</code> with anchors instead. And v1 quietly
+  defaulted a missing grain to weekly — v2 has no default anywhere, so a name that is
+  not in a catalog is an error that lists the catalog.</p>
+</section>
+
+<footer>
+  Generated from the shipped schemas and catalogs of mapping_layer.py,
+  spec_compiler.py, function_library.py and derive_library.py.<br>
+  Companion to the pipeline lab — run <code>python server.py</code> to try any of
+  this against real rows.
+</footer>
+
+</div>
+</body>
+</html>

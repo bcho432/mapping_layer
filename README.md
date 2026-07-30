@@ -68,9 +68,16 @@ that tree. On `ss_spl`, `main` is protected: branch, then merge request.
 the profile. Same numbers either way — that is the point of the toggle.
 
 **run config** — lives entirely in the browser and is echoed back untouched.
-Change the horizon, the season, the engine, and re-run: **every cell of the frame
-must be identical.** That is the invariant the SPEC/run-config split exists to
-protect, and this panel is how you check it rather than assume it.
+Change the horizon, the season, the engine, **or the target column**, and re-run:
+**every cell of the frame must be identical.** That is the invariant the
+SPEC/run-config split exists to protect, and this panel is how you check it
+rather than assume it.
+
+The target picker is the point. The SPEC aggregates; it does not say which
+column is the thing being predicted, because that is a per-run decision. The
+compiler still reports what the profile *intended* as
+`metadata.run_config_hint`, which is what prefills the picker — a suggestion you
+can override without recompiling anything.
 
 **adapter compatibility** — the checks that will move into the engine adapter
 once the run config is real: season length against the grain, horizon against
@@ -88,8 +95,10 @@ to poke directly at frame generation.
 
 ## Things worth trying
 
-- **Clustering.** Edit the SPEC to one key and only `role: "feature"`
-  aggregates, no `time_from`. It works. Under the old pipeline this died at
+- **Clustering.** Edit the SPEC to one key and no `time_from`, then set the
+  target picker to *(none — unsupervised)*. It works, and note that the SPEC
+  itself is unchanged from the supervised case: nothing in it ever said which
+  column was a target. Under the old pipeline this died at
   `spec_compiler.py:246`, and even with that removed the mapping layer returned
   an empty frame because the `got_any` gate only counted targets.
 
@@ -97,11 +106,21 @@ to poke directly at frame generation.
   a single string, so this was unrepresentable.
 
 - **The leakage guard.** Add `"validity": {"arrival_from": "reported_dt"}` to the
-  awards SPEC. The Sept 27 award was not reported until Oct 30, so as a
-  `past_only` feature it is re-filed forward into Q4 — producing a Q4 row with a
-  **null target and a live feature**. The counter reads
+  awards SPEC and set an aggregate's `"anchor": "arrival"`. The Sept 27 award was
+  not reported until Oct 30, so that column's value is re-filed forward into Q4 —
+  producing a Q4 row with a **null in the event-anchored column and a live value
+  in the arrival-anchored one**. The counter reads
   `features_refiled_forward: 1`. That row existing at all is the guard and the
   `got_any` fix working together.
+
+- **Two anchors, one measure.** Aggregate the same column twice, once with
+  `anchor: "event"` and once with `anchor: "arrival"`. You get both the as-it-
+  happened and the as-you-knew-it series side by side, from one pass. This is
+  what `anchor` buys over the old `role` + `availability` pair, which could only
+  express it by pretending one of them was a target.
+
+- **Role is gone.** Put `"role": "target"` on an aggregate. It is rejected, and
+  the message points at the run config.
 
 - **A gap, not a default.** Set a key's `via` to `bin:fortnight`. It fails loudly
   and lists the catalog. The old code silently defaulted a missing grain to
