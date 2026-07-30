@@ -52,6 +52,16 @@
   input,select,textarea{font-family:inherit;font-size:.88rem;color:var(--ink);
     background:var(--ground);border:1px solid var(--line);border-radius:3px;padding:.4rem .5rem;width:100%}
   textarea{font-family:var(--mono);font-size:.74rem;line-height:1.6;resize:vertical}
+  .verdict{margin:0 0 .7rem;padding:.55rem .8rem;border-radius:6px;
+    font-family:var(--mono);font-size:.82rem;border:1px solid}
+  .verdict.good{color:#7ee0b0;border-color:#2f6b52;background:#12241c}
+  .verdict.warn{color:#e3b877;border-color:#6b5730;background:#241d12}
+  .verdict.bad{color:#e88ea0;border-color:#6b3040;background:#241318}
+  .verdict.idle{color:var(--dim);border-color:var(--line);background:transparent}
+  .fc td.fc{color:#8fd7ff;font-weight:600}
+  .csvpick{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.25rem 0 .35rem}
+  .csvpick input[type=file]{font-size:.78rem;max-width:100%}
+  .csvpick .hint{margin:0}
   input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible{
     outline:2px solid var(--accent);outline-offset:1px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
@@ -149,9 +159,14 @@
           </select>
         </label>
         <button id="run">Run the pipeline</button>
-        <p class="hint">Custom data: pick <em>paste your own</em> and drop CSV into the
-          box that appears.</p>
+        <p class="hint">Custom data: pick <em>paste your own</em>, then choose a file
+          or paste into the box. Files are read in the browser &mdash; nothing is
+          uploaded, and the server still receives plain CSV text.</p>
         <label id="csvwrap" style="display:none">CSV
+          <span class="csvpick">
+            <input type="file" id="csvfile" accept=".csv,text/csv">
+            <span id="csvnote" class="hint"></span>
+          </span>
           <textarea id="csv" rows="7" spellcheck="false"></textarea>
         </label>
       </div>
@@ -163,25 +178,44 @@
         <div class="row">
           <label>Engine
             <select id="engine">
-              <option value="nixtla">nixtla</option>
-              <option value="autogluon">autogluon</option>
+              <option value="local">local &mdash; fits, here</option>
+              <option value="nixtla">nixtla &mdash; prepare only</option>
+              <option value="autogluon">autogluon &mdash; prepare only</option>
             </select>
           </label>
-          <label>Model
+          <label data-knob="model">Model
             <select id="model"><option>AutoETS</option><option>AutoARIMA</option><option>auto</option></select>
           </label>
         </div>
-        <div class="row">
+        <div class="row" data-knob="horizon season_length">
           <label>Horizon <input id="horizon" type="number" value="4" min="1"></label>
           <label>Season length <input id="season" type="number" value="4" min="1"></label>
         </div>
-        <div class="row">
+        <div class="row" data-knob="quantiles backtest">
           <label>Quantiles <input id="quantiles" value="0.1, 0.5, 0.9"></label>
           <label>Backtest windows <input id="windows" type="number" value="3" min="0"></label>
         </div>
+        <div class="row" data-knob="top_k holdout">
+          <label>Top-k <input id="topk" type="number" value="5" min="1"></label>
+          <label>Holdout <input id="holdout" type="number" value="0.3" min="0.1"
+                 max="0.6" step="0.05"></label>
+        </div>
+        <div class="row" data-knob="folds">
+          <label>Backtest folds <input id="folds" type="number" value="5" min="1" max="20"></label>
+          <label>&nbsp;</label>
+        </div>
+        <div class="row">
+          <label>Target <input id="rcTarget" placeholder="run to fill"></label>
+          <label>Features <input id="rcFeatures" placeholder="comma separated"></label>
+        </div>
+        <p class="hint" id="knobNote"></p>
+        <p class="hint" id="engineNote"></p>
+        <p class="hint" id="rcNote"></p>
         <p class="hint">Nothing here is sent to a service. It is echoed back untouched so
           you can confirm the frame is a pure function of the SPEC &mdash; change any of
-          these and re-run: every cell must be identical.</p>
+          these and re-run: every cell must be identical. <strong>Target and features
+          now live here too</strong>, so changing what you predict cannot move a
+          single cell of the frame.</p>
       </div>
     </section>
 
@@ -201,6 +235,16 @@
       <div id="stats" class="stats"></div>
       <div id="frame" class="scroll"></div>
       <p id="framenote" class="note"></p>
+    </section>
+
+    <section class="card">
+      <h2>the forecast <span id="engcount" class="pill idle">not run</span></h2>
+      <div class="body">
+        <p id="engverdict" class="verdict"></p>
+        <div id="engstats" class="stats"></div>
+        <div id="engfc" class="scroll"></div>
+        <p id="engnote" class="note"></p>
+      </div>
     </section>
 
     <section class="card">
@@ -239,6 +283,29 @@ async function boot() {
   const sel = $('dataset');
   DATASETS.forEach(d => sel.add(new Option(d.id, d.id)));
   sel.add(new Option('paste your own', '__custom'));
+
+  // A file picker is a convenience over the same textarea: the file is read
+  // locally with FileReader and its text dropped into #csv, so /api/run keeps
+  // receiving exactly what a paste would have sent.
+  $('engine').addEventListener('change', engineHint);
+  engineHint();
+
+  $('csvfile').addEventListener('change', ev => {
+    const f = ev.target.files && ev.target.files[0];
+    const note = $('csvnote');
+    if (!f) { note.textContent = ''; return; }
+    note.textContent = 'reading ' + f.name + '\u2026';
+    const fr = new FileReader();
+    fr.onload = () => {
+      $('csv').value = fr.result;
+      const lines = fr.result.split(/\r?\n/).filter(l => l.trim()).length;
+      const kb = (f.size / 1024).toFixed(1);
+      note.textContent = f.name + ' \u00b7 ' + Math.max(0, lines - 1) +
+                         ' rows \u00b7 ' + kb + ' kB';
+    };
+    fr.onerror = () => { note.textContent = 'could not read ' + f.name; };
+    fr.readAsText(f);
+  });
   sel.onchange = () => {
     $('csvwrap').style.display = sel.value === '__custom' ? 'grid' : 'none';
   };
@@ -252,6 +319,153 @@ async function boot() {
   }).catch(() => {});
 }
 
+function engineHint() {
+  const e = $('engine').value;
+  $('engineNote').textContent = e === 'local'
+    ? 'local fits stdlib exponential smoothing here and returns real predictions '
+      + 'with a rolling-origin accuracy estimate \u2014 no external service.'
+    : e + ' is prepared, not run: you get its dialect payload back to POST wherever '
+      + e + ' lives. Pick local to see numbers.';
+}
+
+function paintKnobs(em) {
+  // The engine declares which knobs it reads; anything else is hidden rather
+  // than left on screen looking like it did something. Before the first run
+  // nothing is known, so everything shows.
+  const known = em && em.knobs ? new Set(em.knobs) : null;
+  document.querySelectorAll('[data-knob]').forEach(el => {
+    const wanted = el.dataset.knob.split(' ');
+    el.style.display = !known || wanted.some(k => known.has(k)) ? '' : 'none';
+  });
+  const ig = (em && em.ignored_knobs) || [];
+  $('knobNote').textContent = !em ? ''
+    : ig.length
+      ? `${em.task} ignores ${ig.join(', ')} — those belong to a different question.`
+      : `Showing the knobs a ${em.task} actually reads.`;
+}
+
+function recTable(preds) {
+  if (!preds || !preds.length) return '<p class="note">No recommendations.</p>';
+  const cols = Object.keys(preds[0]).filter(c => c !== 'is_recommendation');
+  return '<table class="fc"><thead><tr>' + cols.map(c => `<th>${esc(c)}</th>`).join('') +
+    '</tr></thead><tbody>' + preds.slice(0, 40).map(row => '<tr>' + cols.map(c => {
+      const v = row[c];
+      return `<td class="${c === 'score' || c === 'rank' ? 'fc' : ''}">${
+        esc(typeof v === 'number' ? Math.round(v * 1000) / 1000 : v)}</td>`;
+    }).join('') + '</tr>').join('') + '</tbody></table>';
+}
+
+function paintEngine(r) {
+  const em = r.engine_meta, preds = r.predictions || [];
+  const clear = (cls, txt) => {
+    $('engcount').className = 'pill ' + cls;
+    $('engcount').textContent = txt;
+    $('engverdict').className = 'verdict idle';
+    $('engverdict').textContent = '';
+    $('engstats').innerHTML = '';
+    $('engfc').innerHTML = '';
+  };
+  if (!em) { clear('idle', 'not run');
+    $('engnote').textContent = 'No engine ran. Set a run config and re-run.'; return; }
+
+  const fc = preds.filter(p => p.is_forecast === 'yes');
+
+  // prepared-only: the payload is the deliverable, not a number
+  if (em.mode === 'prepare') {
+    clear('warn', em.engine + ' — prepared');
+    $('engfc').innerHTML = '<table><thead><tr>' +
+      Object.keys(preds[0] || {}).map(c => `<th>${esc(c)}</th>`).join('') +
+      '</tr></thead><tbody>' + preds.slice(0, 12).map(row =>
+        '<tr>' + Object.values(row).map(v =>
+          v === null ? '<td class="null">null</td>' : `<td>${esc(v)}</td>`
+        ).join('') + '</tr>').join('') + '</tbody></table>';
+    $('engnote').textContent = em.note || '';
+    return;
+  }
+
+  const a = em.accuracy || {};
+  const v = String(em.verdict || '');
+  $('engcount').className = 'pill ' + (fc.length ? 'ok' : 'warn');
+  $('engcount').textContent = fc.length
+    ? `${fc.length} period${fc.length === 1 ? '' : 's'} ahead` : 'no forecast';
+  $('engverdict').className = 'verdict ' +
+    (v.startsWith('trusted') || v.startsWith('exact') ? 'good'
+     : v.startsWith('weak') || v.startsWith('mixed') ? 'warn'
+     : v.startsWith('unpredictable') ? 'bad' : 'idle');
+  $('engverdict').textContent = v;
+
+  const n = x => x === undefined || x === null ? null
+            : (Math.abs(x) >= 1e6 ? (x / 1e6).toFixed(2) + 'M'
+            : Math.abs(x) >= 1e3 ? (x / 1e3).toFixed(1) + 'k' : String(x));
+  const tiles = [];
+
+  // A recommendation is scored against POPULARITY, not against a naive
+  // forecast, so it needs its own tiles. The forecasting set found nothing in
+  // this accuracy object and rendered an empty row.
+  if (em.task === 'recommend') {
+    const k = a.k;
+    tiles.push([`precision@${k}`, a.precision_at_k, false]);
+    tiles.push([`popularity@${k}`, a.popular_precision_at_k, false]);
+    tiles.push(['lift over popular',
+                (a.lift_over_popularity === null ? '—' : a.lift_over_popularity + '%'),
+                (a.lift_over_popularity || 0) <= 0]);
+    tiles.push([`recall@${k}`, a.recall_at_k, false]);
+    tiles.push([`MAP@${k}`, a.map_at_k, false]);
+    tiles.push(['catalog covered', a.catalog_coverage, false]);
+    tiles.push(['users scored', a.users_scored, false]);
+    if (a.folds > 1) tiles.push(['folds', a.folds, false]);
+    $('engstats').innerHTML = tiles.map(([kk, val, bad]) =>
+      `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(kk)}</span></div>`
+    ).join('');
+    $('engfc').innerHTML = recTable(preds);
+    const spread = (a.lift_min !== undefined)
+      ? ` Across ${a.folds} splits the lift ranged ${a.lift_min}% to ${a.lift_max}%.` : '';
+    $('engnote').textContent =
+      `${a.method} · ${Math.round(a.holdout * 100)}% of each user\u2019s history held back, ` +
+      `${a.users} users, ${a.interactions} interactions. The baseline recommends whatever ` +
+      `is most popular to everybody — beating it is the whole test.` + spread;
+    $('engcount').className = 'pill ' + ((a.lift_over_popularity || 0) > 0 ? 'ok' : 'warn');
+    $('engcount').textContent = `top ${k} per user`;
+    return;
+  }
+
+  if (a.mape !== undefined) tiles.push(['MAPE', a.mape + '%', false]);
+  else if (a.mae !== undefined) tiles.push(['MAE', n(a.mae), false]);
+  if (a.naive_mape !== undefined) tiles.push(['naive', a.naive_mape + '%', false]);
+  else if (a.naive_mae !== undefined) tiles.push(['naive MAE', n(a.naive_mae), false]);
+  if (a.mase !== undefined) tiles.push(['MASE', a.mase, a.mase >= 1]);
+  if (a.skill_vs_naive !== undefined)
+    tiles.push(['skill vs naive', a.skill_vs_naive + '%', a.skill_vs_naive <= 0]);
+  tiles.push(['horizon', em.horizon, false]);
+  tiles.push(['series', em.series_count, false]);
+  $('engstats').innerHTML = tiles.map(([k, val, bad]) =>
+    `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(k)}</span></div>`
+  ).join('');
+
+  if (fc.length) {
+    const cols = Object.keys(fc[0]).filter(c => c !== 'is_forecast');
+    $('engfc').innerHTML = '<table class="fc"><thead><tr>' +
+      cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>' +
+      fc.map(row => '<tr>' + cols.map(c => {
+        const val = row[c];
+        if (val === null || val === undefined) return '<td class="null">null</td>';
+        return `<td class="${c === 'yhat' ? 'fc' : ''}">${esc(
+          typeof val === 'number' ? Math.round(val * 100) / 100 : val)}</td>`;
+      }).join('') + '</tr>').join('') + '</tbody></table>';
+  } else {
+    $('engfc').innerHTML = '<p class="note">No future rows — every series was too ' +
+      'short to fit.</p>';
+  }
+
+  const bad = (em.checks || []).filter(c => !c.ok);
+  $('engnote').textContent = bad.length
+    ? 'Compatibility: ' + bad.map(c => c.check + ' — ' + c.detail).join('; ')
+    : `${em.engine} · ${(a.per_series || [{}])[0].model || '—'} · scored over ` +
+      `${(a.per_series || [{}])[0].points_scored || 0} points across ` +
+      `${(a.per_series || [{}])[0].folds || 0} rolling origins. Accuracy is measured ` +
+      `on data held back from fitting, and compared against carrying the last value forward.`;
+}
+
 function runConfig() {
   return {
     engine: $('engine').value,
@@ -259,7 +473,12 @@ function runConfig() {
     horizon: +$('horizon').value,
     season_length: +$('season').value,
     quantiles: $('quantiles').value.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n)),
-    backtest: { windows: +$('windows').value, step: 1, refit: false }
+    backtest: { windows: +$('windows').value, step: 1, refit: false },
+    target: $('rcTarget').value.trim() || null,
+    features: $('rcFeatures').value.split(',').map(s => s.trim()).filter(Boolean),
+    top_k: +$('topk').value || undefined,
+    holdout: +$('holdout').value || undefined,
+    folds: +$('folds').value || undefined
   };
 }
 
@@ -328,6 +547,19 @@ function render(r) {
     $('bindingEd').value = j(r.binding);
     $('specEd').value = j(r.spec);
   }
+  const crc = r.compiled_run_config;
+  if (crc) {
+    const editing = document.activeElement &&
+                    ['rcTarget', 'rcFeatures'].includes(document.activeElement.id);
+    if (!editing) {
+      $('rcTarget').value = crc.target || (crc.targets || []).join(', ');
+      $('rcFeatures').value = (crc.features || []).join(', ');
+    }
+    $('rcNote').textContent =
+      'Scaffolded by the compiler from the profile\u2019s roles (kind: ' +
+      (crc.kind || '?') + '). The SPEC carries no role \u2014 edit these and ' +
+      're-run: the frame must not move.';
+  }
 
   drawFrame(r);
   drawStats(r);
@@ -350,6 +582,8 @@ function drawFrame(r) {
     return `<td class="${keys.has(c) ? 'k' : ''}">${esc(v)}</td>`;
   }).join('') + '</tr>').join('');
   $('frame').innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+  paintEngine(r);
+  paintKnobs(r.engine_meta);
   $('framenote').textContent =
     `Column names come from the SPEC (naming = ${$('naming').value}). ` +
     `Keys: ${(r.frame_meta.keys || []).join(', ')}.`;

@@ -340,7 +340,10 @@ class SpecCompilerService(BaseService):
             yield Obligation(f"{base}.name", literal=out, origin=f"metric {mname}")
             yield Obligation(f"{base}.using", literal=fn,
                              origin=f"metric {mname}.function")
-            yield Obligation(f"{base}.role", literal=role, origin=f"metric {mname}.role")
+            # `role` is deliberately NOT emitted. Which column you predict is a
+            # modelling decision that changes between runs of the same frame, so
+            # it belongs to the run config. It is still read from the profile
+            # here, to pick the v1 column names and to scaffold that run config.
 
             needs = entry.get("needs", [])
             for need in needs:
@@ -399,10 +402,43 @@ class SpecCompilerService(BaseService):
             yield Obligation("validity.arrival_from", literal=arrival_physical,
                              origin="binding.available_from")
 
+    # ----------------------------------------------------------- run config
+
+    @staticmethod
+    def _run_config(profile, spec, kind, naming):
+        """The modelling half: which emitted columns are the target(s).
+
+        Column names here are the SPEC's output names, so this is already in
+        the frame's vocabulary — the engine adapter never has to look back at
+        the profile.
+        """
+        out_of = {}
+        for j, m in enumerate(profile.get("metrics") or []):
+            if not isinstance(m, dict):
+                continue
+            aggs = spec.get("aggregates") or []
+            if j < len(aggs):
+                out_of[str(m.get("name") or "").strip()] = aggs[j].get("name")
+
+        targets, features = [], []
+        for m in profile.get("metrics") or []:
+            if not isinstance(m, dict):
+                continue
+            col = out_of.get(str(m.get("name") or "").strip())
+            if not col:
+                continue
+            (targets if str(m.get("role") or "").strip().lower() == "target"
+             else features).append(col)
+
+        rc = {"kind": kind, "targets": targets, "features": features}
+        if len(targets) == 1:
+            rc["target"] = targets[0]
+        return rc
+
     # ------------------------------------------------------------ contract
 
     @staticmethod
-    def _check(spec, kind, pad):
+    def _check(spec, kind, pad, roles=()):
         """Hold the emitted SPEC against the contract for this kind.
 
         A template fails loudly -- a slot you forgot to fill is a visible empty
@@ -419,8 +455,12 @@ class SpecCompilerService(BaseService):
         facts = {
             "time_from": bool(spec.get("time_from")),
             "time_bin": any(str(k.get("via") or "").startswith("bin:") for k in keys),
-            "targets": any(a.get("role") == "target" for a in aggs),
-            "features": any(a.get("role") == "feature" for a in aggs),
+            # Read from the profile's roles rather than the emitted SPEC: the
+            # SPEC no longer carries role, but "a forecast needs a target" and
+            # "a cluster must not have one" are still worth failing on, and this
+            # is the last point where the authored intent is in hand.
+            "targets": "target" in roles,
+            "features": "feature" in roles,
             "validity": bool((spec.get("validity") or {}).get("arrival_from")),
         }
         blame = {"time_from": "time_from", "time_bin": "keys",
@@ -541,7 +581,16 @@ class SpecCompilerService(BaseService):
             f"{len(spec.get('keys', []))} key(s), {len(spec.get('aggregates', []))} aggregate(s)")
 
         # -- stage 5: check the contract ---------------------------------
-        self._check(spec, kind, pad)
+        metric_roles = [str(m.get("role") or "").strip().lower()
+                        for m in (profile.get("metrics") or [])
+                        if isinstance(m, dict)]
+        self._check(spec, kind, pad, roles=metric_roles)
+
+        # -- stage 6: scaffold the run config ----------------------------
+        # The SPEC says how the frame is built; this says what to do with it.
+        # Splitting them is what lets the same frame answer a different
+        # question — swap the target here and no cell of the frame changes.
+        report["run_config"] = self._run_config(profile, spec, kind, naming)
         report["stages"].append(f"check: SPEC satisfies the '{kind}' contract")
         return spec, report
 
@@ -708,16 +757,19 @@ class SpecCompilerService(BaseService):
             "time_from": "action_dt",
             "keys": [{"name": "series_id", "from": "naics_code"},
                      {"name": "t", "via": "bin:quarter"}],
-            "aggregates": [{"name": "y", "using": "hhi", "role": "target",
+            "aggregates": [{"name": "y", "using": "hhi",
                             "of": "dollars_obligated", "by": "recipient_parent"}],
         }
         checks["compiled SPEC matches the design doc"] = spec == expected
+        checks["the SPEC says how, the run config says what"] = (
+            "role" not in spec["aggregates"][0]
+            and report["run_config"]["target"] == "y")
 
         # the crosswalk is generated, so it covers the document by construction
         emitted = set()
         for path in ("time_from", "keys[0].name", "keys[0].from", "keys[1].name",
                      "keys[1].via", "aggregates[0].name", "aggregates[0].using",
-                     "aggregates[0].role", "aggregates[0].of", "aggregates[0].by"):
+                     "aggregates[0].of", "aggregates[0].by"):
             emitted.add(path)
         checks["crosswalk covers every emitted path"] = (
             {c["spec"].split(" = ")[0] for c in report["crosswalk"]} == emitted)
@@ -757,8 +809,14 @@ class SpecCompilerService(BaseService):
         checks["feature lowered with binding"] = (
             aggs2[2]["name"] == "x_promo" and aggs2[2]["of"] == "promo_flag")
         checks["feature availability copied"] = aggs2[2]["availability"] == "known_ahead"
-        checks["roles reach the spec"] = (
-            [a["role"] for a in aggs2] == ["target", "target", "feature"])
+        checks["role does NOT reach the spec"] = (
+            not any("role" in a for a in aggs2))
+        checks["roles reach the run config instead"] = (
+            report2["run_config"]["targets"] == ["revenue", "units"]
+            and report2["run_config"]["features"] == ["x_promo"])
+        checks["single target also exposed as run_config.target"] = (
+            report["run_config"].get("target") == "y")
+        checks["run config carries the kind"] = report2["run_config"]["kind"] == "forecast"
         checks["list indices densify past the role split"] = len(aggs2) == 3
 
         # ---- available_from flows through from the binding ----
@@ -829,8 +887,11 @@ class SpecCompilerService(BaseService):
             checks["regress emits no time_from"] = (
                 "time_from" not in kinds["regress: no clock at all"])
         if kinds["cluster: no target at all"]:
-            checks["cluster emits only features"] = all(
-                a["role"] == "feature"
+            # The SPEC cannot say "these are features" any more, and does not
+            # need to: a clustering frame is just columns. What must still hold
+            # is that nothing was nominated as a target.
+            checks["cluster emits aggregates with no role"] = all(
+                "role" not in a
                 for a in kinds["cluster: no target at all"]["aggregates"])
         if kinds["recommend: two keys"]:
             checks["recommend emits two entity keys"] = (

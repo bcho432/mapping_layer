@@ -36,6 +36,7 @@ Deterministic, stdlib only - no LLM, no package_dependencies.
 
 import asyncio
 import re
+from datetime import datetime
 
 from spl.core.base_service.base_service_class import BaseService
 from spl.core.service_types import ParameterEnum
@@ -53,9 +54,49 @@ AVAIL = ("known_ahead", "past_only")
 _DATEISH = re.compile(r"(date|_dt$|^dt$|time|period|timestamp|^ds$|_at$|day)", re.I)
 _ENTITYISH = re.compile(r"(vendor|recipient|parent|supplier|customer|company|"
                         r"account|entity|name|_id$|^id$)", re.I)
+# Which questions have a time axis at all. Sourced from the compiler's own
+# CONTRACT table: forecast and anomaly require time_from; the rest permit or
+# forbid it.
+CLOCKED_KINDS = ("forecast", "anomaly")
+KNOWN_KINDS = ("forecast", "anomaly", "classify", "cluster", "regress",
+               "recommend", "rank")
+
+_RECOMMENDISH = re.compile(
+    r"(recommend|suggest.*(item|product|movie|title|track|article)|"
+    r"what should|who should|similar (items?|products?)|"
+    r"personalis|personaliz|cross[- ]sell|up[- ]sell|next best)", re.I)
 _DIMISH = re.compile(r"(category|type|class|region|state|store|segment|group|"
                      r"naics|sector|dept|department|channel|product|market|branch)", re.I)
 _NUMTYPES = ("number", "numeric", "integer", "int", "float", "double", "decimal", "money")
+
+# Formats a sample value may take. Kept in step with the mapping layer's
+# DATE_FORMATS: a column this accepts must be one the executor can bucket.
+_SAMPLE_DATE_FORMATS = ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y%m%d",
+                        "%Y-%m", "%Y/%m", "%m/%Y", "%m-%Y",
+                        "%b %Y", "%B %Y", "%d %b %Y", "%d %B %Y")
+
+
+def _looks_like_date(sample):
+    """Does this value parse as a date? Names lie; values do not."""
+    if sample is None:
+        return False
+    s = str(sample).strip()
+    if not s or not any(ch.isdigit() for ch in s):
+        return False
+    # A plain number is a quantity, not a date - except an 8-digit YYYYMMDD.
+    try:
+        float(s.replace(",", ""))
+        if not (len(s) == 8 and s.isdigit()):
+            return False
+    except ValueError:
+        pass
+    for fmt in _SAMPLE_DATE_FORMATS:
+        try:
+            datetime.strptime(s, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
 _DATETYPES = ("date", "datetime", "timestamp", "time")
 
 
@@ -102,11 +143,23 @@ class ProfileGeneratorService(BaseService):
         dataset = str(p.get("dataset") or "dataset").strip() or "dataset"
         warnings = []
 
+        # -- which question is this? -------------------------------------
+        # A recommendation has no clock: it keys a user x item grid. Deciding
+        # that here, before demanding a date column, is what stops an entirely
+        # valid interaction log being rejected as "not forecastable".
+        kind = str(p.get("kind") or "").strip().lower()
+        if not kind:
+            kind = ("recommend" if _RECOMMENDISH.search(goal_l) else "forecast")
+        if kind == "recommend":
+            return self._suggest_recommend(cols, goal, goal_l, dataset, warnings)
+
         # -- time column (no forecasting without one) --------------------
         date_col = self._pick(cols, self._is_date)
         if not date_col:
             raise ValueError(
-                "no time column found in the schema (need a date/timestamp to forecast)")
+                "no time column found in the schema (need a date/timestamp to "
+                "forecast). If you meant to recommend, say so in the goal — "
+                "a user x item grid needs no clock.")
 
         # -- grain: explicit override, else goal keyword, else month -----
         grain = str(p.get("grain") or "").strip().lower()
@@ -199,6 +252,78 @@ class ProfileGeneratorService(BaseService):
         }
         return profile, report
 
+    # ------------------------------------------------------ suggest: recommend
+
+    def _suggest_recommend(self, cols, goal, goal_l, dataset, warnings):
+        """A user x item grid. Two entity keys, one weight, no clock."""
+        # An id-shaped column beats a plain category: `viewer` and `title` are
+        # the grid, `genre` is a description of one axis of it.
+        ranked = [c for c in cols if self._is_entity(c) or self._is_dim(c)]
+        ranked += [c for c in cols if self._is_plain_string(c) and c not in ranked]
+        # An id is often written as a number. `store_nbr` holds 12 and 44, so
+        # every entity test rejected it and a two-axis grid came back with one
+        # axis. A low-cardinality numeric with an id-shaped name is a thing,
+        # not a quantity — the same trap as a NAICS code being averaged.
+        ranked += [c for c in cols
+                   if c not in ranked and self._is_number(c)
+                   and not self._is_date(c)
+                   and (_ENTITYISH.search(c["name"]) or _DIMISH.search(c["name"]))
+                   and isinstance(c.get("cardinality"), (int, float))
+                   and 1 < c["cardinality"] <= 50]
+        named = [c for c in ranked if c["name"].lower() in goal_l]
+        for c in reversed(named):                       # the goal names them first
+            ranked.remove(c)
+            ranked.insert(0, c)
+        if len(ranked) < 2:
+            raise ValueError(
+                "a recommendation needs two entity columns (who, and what) — "
+                f"found {len(ranked)} in the schema")
+        user_col, item_col = ranked[0]["name"], ranked[1]["name"]
+
+        # The weight is what engagement was worth. Absent one, every observed
+        # pair counts once, which is the implicit-feedback reading.
+        nums = [c for c in cols if self._is_number(c) and not self._is_date(c)
+                and c["name"] not in (user_col, item_col)]
+        weight = next((c["name"] for c in nums if c["name"].lower() in goal_l),
+                      nums[0]["name"] if nums else None)
+        if weight:
+            metric = {"name": f"max_{weight}", "function": "max",
+                      "role": "target", "measure": weight}
+        else:
+            metric = {"name": "interactions", "function": "count",
+                      "role": "target"}
+            warnings.append(
+                "no numeric column to weight the grid; counting interactions "
+                "instead, which is the implicit-feedback reading")
+
+        profile = {
+            "name": self._slug(goal) or dataset,
+            "version": "1",
+            "kind": "recommend",
+            "datasets": [{"name": dataset}],
+            "keys": [{"name": f"k_{user_col}", "from": user_col},
+                     {"name": f"k_{item_col}", "from": item_col}],
+            "metrics": [metric],
+            "dimensions": [{"name": user_col}, {"name": item_col}],
+        }
+        binding_stub = {
+            "source": dataset,
+            "bind": {n: n for n in dict.fromkeys(
+                [user_col, item_col] + ([weight] if weight else []))},
+            "available_from": "",
+        }
+        report = {
+            "mode": "suggest", "goal": goal, "kind": "recommend",
+            "chose": {"user": user_col, "item": item_col, "weight": weight,
+                      "function": metric["function"]},
+            "binding_stub": binding_stub,
+            "warnings": warnings,
+            "note": ("A user x item grid keyed on two entity columns, with no "
+                     "clock. Which column is the user and which is the item is "
+                     "a guess from names and order — check it before signing."),
+        }
+        return profile, report
+
     # -------------------------------------------------------- finalize mode
 
     def _finalize(self, p):
@@ -212,12 +337,23 @@ class ProfileGeneratorService(BaseService):
         if not isinstance(metrics, list) or not metrics:
             raise ValueError("draft.metrics must be a non-empty list")
 
+        # Only a question with a clock needs one. Demanding `time.event` of
+        # every profile rejected recommendation outright, which keys a user x
+        # item grid and has no time axis at all.
+        kind = str(draft.get("kind") or "forecast").strip().lower()
         time = draft.get("time")
-        if not isinstance(time, dict) or not str(time.get("event") or "").strip():
-            raise ValueError("draft.time.event is required")
-        grain = str(time.get("grain") or "").strip().lower()
-        if grain not in GRAINS:
-            raise ValueError(f"draft.time.grain must be one of {GRAINS}, got '{time.get('grain')}'")
+        has_time = isinstance(time, dict) and str(time.get("event") or "").strip()
+        if kind in CLOCKED_KINDS and not has_time:
+            raise ValueError(
+                f"draft.time.event is required for kind '{kind}' "
+                f"(kinds without a clock: "
+                f"{', '.join(sorted(set(KNOWN_KINDS) - set(CLOCKED_KINDS)))})")
+        grain = ""
+        if has_time:
+            grain = str(time.get("grain") or "").strip().lower()
+            if grain not in GRAINS:
+                raise ValueError(
+                    f"draft.time.grain must be one of {GRAINS}, got '{time.get('grain')}'")
 
         dim_names = []
         for d in (draft.get("dimensions") or []):
@@ -291,8 +427,15 @@ class ProfileGeneratorService(BaseService):
             "datasets": draft.get("datasets") or [{"name": "dataset"}],
             "metrics": norm_metrics,
             "dimensions": [{"name": d} for d in dim_names],
-            "time": {"event": str(time["event"]).strip(), "grain": grain},
         }
+        if kind != "forecast":
+            profile["kind"] = kind
+        if has_time:
+            profile["time"] = {"event": str(time["event"]).strip(), "grain": grain}
+        # An explicit keys[] is the general form and must survive finalize —
+        # it is the only way a clockless question names its axes.
+        if isinstance(draft.get("keys"), list) and draft["keys"]:
+            profile["keys"] = draft["keys"]
         if series:
             profile["x-deep"] = {"series": series}
 
@@ -340,7 +483,12 @@ class ProfileGeneratorService(BaseService):
             return True
         if c["type"] in _NUMTYPES:
             return False
-        return bool(_DATEISH.search(c["name"]))
+        if _DATEISH.search(c["name"]):
+            return True
+        # The name is only a hint. A column called `Month` holding "1949-01" is
+        # a date whatever it is called, and reading the value is the difference
+        # between recognising a file and rejecting it.
+        return _looks_like_date(c.get("sample"))
 
     def _is_number(self, c):
         if c["type"] in _NUMTYPES:

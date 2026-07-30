@@ -35,9 +35,23 @@ GRAINS = derive_library.GRAINS
 DERIVES = tuple(n for n, e in derive_library.embedded_catalog().items()
                 if e["returns"] == "scalar")
 AVAIL = ("known_ahead", "past_only")
+# `role` used to split aggregates into targets and features. Which column you
+# are PREDICTING is a modelling decision that changes between runs of the same
+# frame, so it moved to the run config; the SPEC now says only how the frame is
+# built. The field is still accepted and ignored, so v1 specs keep running.
+#
+# `availability` stays, because it is a fact about the DATA: whether a value is
+# knowable ahead of the period it describes. It alone drives the leakage guard.
+# Absent means "no arrival semantics" — what targets always had.
 ROLES = ("target", "feature")
 FILTER_OPS = ("equals", "notEquals", "greaterThan", "lessThan", "contains", "isEmpty", "isNotEmpty")
-DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y%m%d")
+# Month-precision stamps ("1949-01") are ordinary in time series and parsed as
+# nothing before: fromisoformat rejects them and no format matched, so a whole
+# file was unreadable. Bare "%Y" stays out — it would turn every integer column
+# of years, and much else, into a date.
+DATE_FORMATS = ("%m/%d/%Y", "%m/%d/%y", "%Y%m%d",
+                "%Y-%m", "%Y/%m", "%m/%Y", "%m-%Y",
+                "%b %Y", "%B %Y", "%d %b %Y", "%d %B %Y")
 
 # series bucket key for rows from sources that don't carry the series column;
 # their values are broadcast onto every concrete series at the same t
@@ -311,15 +325,15 @@ class MappingLayerService(BaseService):
         # One entry per output column that is not a key. `role` is a field, not
         # a section, which is what lets a frame have several targets, or none
         # at all (clustering) without the executor knowing what a kind is.
-        targets, features, seen = [], [], set(key_names)
+        measures, derived, seen = [], [], set(key_names)
         for i, a in enumerate(p.get("aggregates") or []):
             if not isinstance(a, dict):
                 raise ValueError(f"aggregates[{i}] must be an object")
             name = str(a.get("name") or "").strip()
             if not name:
                 raise ValueError(f"aggregates[{i}].name is required")
-            role = str(a.get("role") or "target").strip().lower()
-            if role not in ROLES:
+            role = str(a.get("role") or "").strip().lower()   # accepted, ignored
+            if role and role not in ROLES:
                 raise ValueError(f"aggregate '{name}': role must be one of {ROLES}, got '{role}'")
             out = str(a.get("out") or "").strip() or name
             if out in key_names:
@@ -353,18 +367,16 @@ class MappingLayerService(BaseService):
                 if not ent_raw:
                     raise ValueError(f"{role} '{name}': function '{fn_name}' needs an 'entity' column")
                 _, entity_col = qualify(ent_raw, src, f"{role} '{name}' entity")
-            item = {"name": name, "out": out, "fn": fn_name, "kind": fmeta["kind"],
-                    "shelf": fmeta["shelf"], "source": src, "column": col,
-                    "entity_col": entity_col, "ord": int(a.get("ord") or i)}
-            if role == "target":
-                targets.append(item)
-            else:
-                availability = str(a.get("availability") or "past_only").strip().lower()
-                if availability not in AVAIL:
-                    raise ValueError(
-                        f"feature '{name}': availability must be one of {AVAIL}, got '{availability}'")
-                item.update({"derive": "", "derive_key": None, "availability": availability})
-                features.append(item)
+            raw_av = str(a.get("availability") or "").strip().lower()
+            if raw_av and raw_av not in AVAIL:
+                raise ValueError(
+                    f"aggregate '{name}': availability must be one of {AVAIL}, "
+                    f"got '{raw_av}'")
+            measures.append({
+                "name": name, "out": out, "fn": fn_name, "kind": fmeta["kind"],
+                "shelf": fmeta["shelf"], "source": src, "column": col,
+                "entity_col": entity_col, "ord": int(a.get("ord") or i),
+                "derive": "", "derive_key": None, "availability": raw_av or None})
 
         # -- P3 key-scope derives -------------------------------------------
         # Calendar projections of a binned key. They read the bucket's sort
@@ -407,15 +419,16 @@ class MappingLayerService(BaseService):
             if availability not in AVAIL:
                 raise ValueError(
                     f"derive '{name}': availability must be one of {AVAIL}, got '{availability}'")
-            features.append({
+            derived.append({
                 "name": name, "out": out, "fn": None, "kind": "derived", "shelf": "core",
                 "source": None, "column": "", "entity_col": "",
                 "derive": via, "derive_key": idx, "availability": availability,
                 "ord": int(d["ord"]) if d.get("ord") is not None else 1000 + i,
             })
-        features.sort(key=lambda f: f["ord"])
+        measures.sort(key=lambda m: m["ord"])
+        derived.sort(key=lambda d: d["ord"])
 
-        if not targets and not features:
+        if not measures and not derived:
             raise ValueError("at least one aggregate is required (nothing would be computed)")
 
         # -- P2 filters -----------------------------------------------------
@@ -438,7 +451,7 @@ class MappingLayerService(BaseService):
         return {
             "sources": sources, "multi": multi, "source_from": source_from,
             "keys": keys, "spine": spine, "t_key": t_key, "time_grain": time_grain,
-            "targets": targets, "features": features, "filters": filters,
+            "measures": measures, "derived": derived, "filters": filters,
         }
 
     # ---------------------------------------------------------- the recipe
@@ -448,12 +461,10 @@ class MappingLayerService(BaseService):
                    "bad_time": 0, "bad_measure": 0}
         keys, spine = spec["keys"], spec["spine"]
         src_by_id = {s["id"]: s for s in spec["sources"]}
-        tg_by_src, ft_by_src, flt_by_src = {}, {}, {}
-        for tg in spec["targets"]:
-            tg_by_src.setdefault(tg["source"], []).append(tg)
-        for f in spec["features"]:
-            if f["source"] is not None:
-                ft_by_src.setdefault(f["source"], []).append(f)
+        mv_by_src, flt_by_src = {}, {}
+        for m in spec["measures"]:
+            if m["source"] is not None:
+                mv_by_src.setdefault(m["source"], []).append(m)
         for f in spec["filters"]:
             if not f["skip"]:
                 flt_by_src.setdefault(f["source"], []).append(f)
@@ -500,29 +511,14 @@ class MappingLayerService(BaseService):
                 continue
             klab, ksort = built
 
-            b = buckets.setdefault(klab, {"sort": ksort, "tv": {}, "fv": {}})
-            for tg in tg_by_src.get(src["id"], []):
-                if tg["kind"] == "group":
-                    v = self._parse_number(row.get(tg["column"]))
-                    if v is None:
-                        dropped["bad_measure"] += 1
-                    else:
-                        ent = row.get(tg["entity_col"])
-                        ent = "" if ent is None else str(ent).strip()
-                        d = b["tv"].setdefault(tg["name"], {})
-                        d[ent] = d.get(ent, 0.0) + v
-                elif tg["fn"] == "count" and not tg["column"]:
-                    b["tv"].setdefault(tg["name"], []).append(1.0)
-                else:
-                    v = self._parse_number(row.get(tg["column"]))
-                    if v is None:
-                        dropped["bad_measure"] += 1
-                    else:
-                        b["tv"].setdefault(tg["name"], []).append(v)
-            for f in ft_by_src.get(src["id"], []):
+            b = buckets.setdefault(klab, {"sort": ksort, "mv": {}})
+            for f in mv_by_src.get(src["id"], []):
                 # past_only covariates that arrived after their event bucket are
                 # re-filed forward to the bucket where they became knowable, so a
                 # value can never leak into a row that predates knowing it.
+                # Only a measure that DECLARES arrival semantics can be
+                # re-filed. Absent availability is what every target had, so
+                # those keep landing in their own event bucket.
                 forward = (bool(spine) and f["availability"] == "past_only"
                            and av_sort > ev_sort)
                 if forward:
@@ -530,7 +526,7 @@ class MappingLayerService(BaseService):
                     for si in spine:
                         alab[si], asort[si] = av_lab, av_sort
                     fb = buckets.setdefault(tuple(alab),
-                                            {"sort": tuple(asort), "tv": {}, "fv": {}})
+                                            {"sort": tuple(asort), "mv": {}})
                 else:
                     fb = b
                 moved = False
@@ -539,22 +535,22 @@ class MappingLayerService(BaseService):
                     if fv is not None:
                         ent = row.get(f["entity_col"])
                         ent = "" if ent is None else str(ent).strip()
-                        gd = fb["fv"].setdefault(f["name"], {})
+                        gd = fb["mv"].setdefault(f["name"], {})
                         gd[ent] = gd.get(ent, 0.0) + fv
                         moved = True
                 elif f["fn"] == "count" and not f["column"]:
-                    fb["fv"].setdefault(f["name"], []).append(1.0)
+                    fb["mv"].setdefault(f["name"], []).append(1.0)
                     moved = True
                 else:
                     fv = self._parse_number(row.get(f["column"]))
                     if fv is not None:
-                        fb["fv"].setdefault(f["name"], []).append(fv)
+                        fb["mv"].setdefault(f["name"], []).append(fv)
                         moved = True
                 if forward and moved:
                     refiled += 1
 
         # -- merge (align the sources) & emit ------------------------------
-        gaps = {tg["out"]: 0 for tg in spec["targets"]}
+        gaps = {m["out"]: 0 for m in spec["measures"]}
         frame = []
 
         def pick(store, name, b, extras):
@@ -574,23 +570,18 @@ class MappingLayerService(BaseService):
             # value. Derived columns are always defined, so counting them would
             # emit every bucket; targets alone would drop every clustering row.
             got_any = False
-            for tg in spec["targets"]:
-                v = self._reduce(tg["fn"], tg["kind"], pick("tv", tg["name"], b, extras))
-                out[tg["out"]] = round(v, 6) if v is not None else None
+            for m in spec["measures"]:
+                v = self._reduce(m["fn"], m["kind"], pick("mv", m["name"], b, extras))
+                out[m["out"]] = round(v, 6) if v is not None else None
                 got_any = got_any or v is not None
-            for f in spec["features"]:
-                if f["derive"]:
-                    out[f["out"]] = derive_library.apply_scalar(
-                        f["derive"], b["sort"][f["derive_key"]])
-                    continue
-                v = self._reduce(f["fn"], f["kind"], pick("fv", f["name"], b, extras))
-                out[f["out"]] = round(v, 6) if v is not None else None
-                got_any = got_any or v is not None
+            for d in spec["derived"]:
+                out[d["out"]] = derive_library.apply_scalar(
+                    d["derive"], b["sort"][d["derive_key"]])
             if not got_any:
                 return None
-            for tg in spec["targets"]:
-                if out[tg["out"]] is None:
-                    gaps[tg["out"]] += 1
+            for m in spec["measures"]:
+                if out[m["out"]] is None:
+                    gaps[m["out"]] += 1
             return out
 
         # A bucket carries _BCAST in every key position its source could not
@@ -630,23 +621,30 @@ class MappingLayerService(BaseService):
             "t_max": max((r[spec["t_key"]] for r in frame), default=None) if spec["t_key"] else None,
             "grain": spec["time_grain"],
             "keys": [k["name"] for k in keys],
-            "targets": [{"name": tg["name"], "fn": tg["fn"], "shelf": tg["shelf"],
-                         "source": tg["source"], "measure": tg["column"],
-                         "entity": tg["entity_col"] or None} for tg in spec["targets"]],
-            "features": [
-                {"name": f["name"],
-                 "source": f["derive"] or f["column"],
-                 "kind": f["kind"],
-                 "fn": f["fn"],
-                 "availability": f["availability"]}
-                for f in spec["features"]
-            ],
+            # One list. The frame does not know which of these you intend to
+            # predict — the run config says that, and saying it there is what
+            # lets the same frame serve a different question without rebuilding.
+            "measures": [{"name": m["name"], "out": m["out"], "fn": m["fn"],
+                          "shelf": m["shelf"], "source": m["source"],
+                          "measure": m["column"],
+                          "entity": m["entity_col"] or None,
+                          "availability": m["availability"]}
+                         for m in spec["measures"]],
+            "derived": [{"name": d["name"], "out": d["out"], "via": d["derive"],
+                         "availability": d["availability"]}
+                        for d in spec["derived"]],
         }
-        if spec["multi"] or len(spec["targets"]) > 1:
-            meta["join"] = {"on": "time", "gaps": gaps}
-            if spec["multi"]:
-                meta["join"]["broadcast_unmatched"] = broadcast_unmatched
-                meta["sources"] = {"rows_in": src_counts}
+        # A null count per measure is useful whichever way the frame was built,
+        # but a *join* gap is only a thing when there is more than one source to
+        # join. The old rule keyed this off "more than one target", which is not
+        # expressible now that role has moved to the run config — and was never
+        # quite what it meant anyway.
+        if any(gaps.values()):
+            meta["nulls_per_measure"] = {k: v for k, v in gaps.items() if v}
+        if spec["multi"]:
+            meta["join"] = {"on": "time", "gaps": gaps,
+                            "broadcast_unmatched": broadcast_unmatched}
+            meta["sources"] = {"rows_in": src_counts}
         if any(s["available_from"] for s in spec["sources"]):
             meta["leakage"] = {"features_refiled_forward": refiled}
         return frame, meta
@@ -1012,8 +1010,11 @@ class MappingLayerService(BaseService):
         checks["promo aggregated with max"] = cell(frame, "store_12", "2024-W01")["x_promo"] == 1.0
         checks["derived week_of_year"] = cell(frame, "store_12", "2024-W01")["x_week_of_year"] == 1
         checks["bad date dropped and counted"] = meta["rows_dropped"]["bad_time"] == 1
-        checks["availability reaches metadata"] = meta["features"][0]["availability"] == "known_ahead"
-        checks["no join block for single target"] = "join" not in meta
+        checks["availability reaches metadata"] = any(
+            m["availability"] == "known_ahead" for m in meta["measures"])
+        checks["metadata reports one measure list, not target/feature"] = (
+            "measures" in meta and "targets" not in meta and "features" not in meta)
+        checks["no join block for a single source"] = "join" not in meta
 
         # same recipe expressed as targets[]
         spec_t = self._resolve_spec({
@@ -1148,9 +1149,9 @@ class MappingLayerService(BaseService):
         checks["top_share as a group feature"] = (
             abs(cell(hhi_frame, "A", "2024")["x_top"] - 60.0) < 1e-6)
         checks["group function reaches metadata with its shelf"] = (
-            hhi_meta["targets"][0]["fn"] == "hhi"
-            and hhi_meta["targets"][0]["shelf"] == "supply-chain"
-            and hhi_meta["targets"][0]["entity"] == "vendor")
+            hhi_meta["measures"][0]["fn"] == "hhi"
+            and hhi_meta["measures"][0]["shelf"] == "supply-chain"
+            and hhi_meta["measures"][0]["entity"] == "vendor")
 
         # non-positive category base -> undefined -> null -> row omitted
         neg = [{"cat": "D", "yr": "2024-01-01", "vendor": "v1", "amt": "-10"},

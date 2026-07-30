@@ -111,10 +111,12 @@ import importlib  # noqa: E402  (must follow the stub install)
 PG = importlib.import_module("spl.services.profile_generator.profile_generator")
 SC = importlib.import_module("spl.services.spec_compiler.spec_compiler")
 ML = importlib.import_module("spl.services.mapping_layer.mapping_layer")
+EA = importlib.import_module("spl.services.engine_adapter.engine_adapter")
 
 profile_generator = PG.ProfileGeneratorService()
 spec_compiler = SC.SpecCompilerService()
 mapping_layer = ML.MappingLayerService()
+engine_adapter = EA.EngineAdapterService()
 
 
 # -------------------------------------------------------------------- data
@@ -218,6 +220,27 @@ def run(payload):
     frame = step("frame", "mapping-layer", execute)
     meta = stages[-1]["detail"]
 
+    # 5 -- engine-adapter. The frame is the deliverable; this is what finally
+    # does something with it. Skipped when the caller asks for the frame only.
+    rc = dict(payload.get("run_config") or {})
+    crc = next((st.get("detail", {}).get("run_config") for st in stages
+                if st["id"] == "compile" and isinstance(st.get("detail"), dict)),
+               None) or {}
+    for k in ("target", "targets", "features"):
+        if not rc.get(k) and crc.get(k):
+            rc[k] = crc[k]
+    predictions, engine_meta = None, None
+    if payload.get("engine") is not False and rc:
+        def adapt():
+            return engine_adapter._adapt(frame, {"run_config": rc,
+                                                 "frame_meta": meta,
+                                                 "mode": payload.get("mode")})
+        try:
+            predictions = step("engine", "engine-adapter", adapt)
+            engine_meta = stages[-1]["detail"]
+        except Halt:
+            predictions, engine_meta = None, None
+
     cols = []
     for r in frame:
         for k in r:
@@ -236,6 +259,15 @@ def run(payload):
         "frame_meta": meta,
         # echoed straight back, never used: proof it cannot touch the frame
         "run_config": payload.get("run_config"),
+        # what the compiler scaffolded: which emitted columns the profile
+        # nominated as target(s). This used to live in the SPEC as
+        # aggregates[].role; it is a modelling choice, so it belongs here.
+        "predictions": predictions,
+        "engine_meta": engine_meta,
+        "compiled_run_config": next(
+            (st.get("detail", {}).get("run_config") for st in stages
+             if st["id"] == "compile" and isinstance(st.get("detail"), dict)),
+            None),
     }
 
 
@@ -267,7 +299,8 @@ class Handler(BaseHTTPRequestHandler):
             out = {}
             for sid, svc in (("profile-generator", profile_generator),
                              ("spec-compiler", spec_compiler),
-                             ("mapping-layer", mapping_layer)):
+                             ("mapping-layer", mapping_layer),
+                             ("engine-adapter", engine_adapter)):
                 r = svc.self_test()
                 checks = r.get("checks", {})
                 out[sid] = {
