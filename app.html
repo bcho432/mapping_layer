@@ -152,6 +152,13 @@
             </select>
           </label>
         </div>
+        <label>Who reads the goal
+          <select id="reader">
+            <option value="llm">a model &mdash; reads the sentence</option>
+            <option value="regex">keywords only &mdash; deterministic</option>
+          </select>
+        </label>
+        <p class="hint" id="readerNote"></p>
         <label>Frame column names
           <select id="naming">
             <option value="v1">v1 &mdash; series_id / t / y / x_*</option>
@@ -289,6 +296,8 @@ async function boot() {
   // receiving exactly what a paste would have sent.
   $('engine').addEventListener('change', engineHint);
   engineHint();
+  $('reader').addEventListener('change', () => { readerHint(); run(); });
+  readerHint();
 
   $('csvfile').addEventListener('change', ev => {
     const f = ev.target.files && ev.target.files[0];
@@ -317,6 +326,15 @@ async function boot() {
     el.textContent = bad ? `${bad} self-test failure(s)` : `self-tests ${tot}/${tot}`;
     el.title = Object.entries(st).map(([k, v]) => `${k}: ${v.passed}/${v.total}`).join('\n');
   }).catch(() => {});
+}
+
+function readerHint() {
+  $('readerNote').textContent = $('reader').value === 'llm'
+    ? 'A model corrects the keyword draft, then the same deterministic validation '
+      + 'runs on the result \u2014 an unknown column or function is rejected and the '
+      + 'draft is kept.'
+    : 'Keyword matching only. Reproducible and free, but it cannot read negation '
+      + 'or a synonym that is not in the table.';
 }
 
 function engineHint() {
@@ -491,6 +509,7 @@ function payload(extra) {
     csv: id === '__custom' ? $('csv').value : (ds ? ds.csv : ''),
     grain: $('grain').value,
     naming: $('naming').value,
+    llm: $('reader').value === 'llm',
     run_config: runConfig()
   }, extra || {});
 }
@@ -520,11 +539,31 @@ function render(r) {
     const d = document.createElement('details');
     d.className = 'stage' + (s.ok ? '' : ' bad');
     d.open = !s.ok;
-    const shown = s.ok ? j(s.output) : (s.error + '\n\n' + (s.trace || []).join('\n'));
+    // The LLM stage's interesting output is WHY it changed things, not the
+    // profile it returned — that shows up in the profile panel anyway.
+    let shown;
+    if (!s.ok) {
+      shown = s.error + '\n\n' + (s.trace || []).join('\n');
+    } else if (s.id === 'llm') {
+      const d = s.detail || {};
+      shown = (d.off ? 'turned off \u2014 keywords are reading the goal.\n'
+                        + 'Switch "Who reads the goal" to compare.'
+                     : d.used ? 'the model read the goal and changed:\n'
+                        + (d.changes || []).map(c => '  - ' + c).join('\n')
+                        + (d.changes && d.changes.length ? '' : '  (nothing)')
+                        + `\n\nmodel ${d.model}`
+                        + (d.usage ? `  ·  ${d.usage.input} in / ${d.usage.output} out tokens` : '')
+                     : 'not used — kept the keyword scaffold\nreason: ' + (d.reason || '?'))
+              + (d.rejected ? '\n\nrejected because:\n'
+                              + d.rejected.map(x => '  - ' + x).join('\n') : '');
+    } else {
+      shown = j(s.output);
+    }
     d.innerHTML = `<summary>
         <span class="n">S${i + 1}</span>
         <span class="nm">${s.title}</span>
-        <span class="pill ${s.ok ? 'ok' : 'bad'}">${s.ok ? 'ok' : 'failed'}</span>
+        <span class="pill ${s.ok ? (s.id === 'llm' && !(s.detail || {}).used ? 'idle' : 'ok') : 'bad'}">${
+          s.ok ? (s.id === 'llm' ? ((s.detail || {}).used ? 'read the goal' : 'skipped') : 'ok') : 'failed'}</span>
         <span class="ms">${s.ms} ms</span>
       </summary>` + (s.ok ? `<pre>${esc(shown)}</pre>` : `<div class="err">${esc(shown)}</div>`);
     flow.appendChild(d);

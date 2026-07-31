@@ -112,6 +112,8 @@ PG = importlib.import_module("spl.services.profile_generator.profile_generator")
 SC = importlib.import_module("spl.services.spec_compiler.spec_compiler")
 ML = importlib.import_module("spl.services.mapping_layer.mapping_layer")
 EA = importlib.import_module("spl.services.engine_adapter.engine_adapter")
+FL = importlib.import_module("spl.services.mapping_layer.function_library")
+import llm_profile  # bench-side only: the services stay stdlib-only
 
 profile_generator = PG.ProfileGeneratorService()
 spec_compiler = SC.SpecCompilerService()
@@ -198,6 +200,40 @@ def run(payload):
             }))
         binding = binding if isinstance(binding, dict) else \
             stages[-1]["detail"]["binding_stub"]
+
+        # The model sits BETWEEN the two deterministic halves. It only ever
+        # touches a draft, and whatever it returns still has to survive
+        # finalize — which is what makes a bad reply a fallback, not a bug.
+        # Which reader parses the goal is a pipeline choice, not a modelling
+        # one, so it rides alongside `naming` rather than in the run config —
+        # it changes how the SPEC is authored, not what the engine does with
+        # the frame. Absent means "use the model if a credential exists".
+        goal = payload.get("goal") or ""
+        use_llm = payload.get("llm")
+        use_llm = True if use_llm is None else bool(use_llm)
+        if goal.strip() and use_llm:
+            def enrich():
+                prof, rep = llm_profile.enrich(
+                    draft, schema, goal, FL.catalog(),
+                    binding_stub=binding)
+                return prof, rep
+            enriched = step("llm", "llm (read the goal)", enrich)
+            llm_report = stages[-1]["detail"]
+            if llm_report.get("used"):
+                draft = enriched
+                binding = llm_profile.rebind(binding, draft, dataset)
+
+        elif goal.strip():
+            stages.append({
+                "id": "llm", "title": "llm (read the goal)", "ok": True, "ms": 0.0,
+                "output": None,
+                "detail": {"used": False, "model": llm_profile.MODEL,
+                           "changes": [], "off": True,
+                           "credential": llm_profile.credential_source() or "none",
+                           "reason": "turned off — the keyword scaffold is "
+                                     "reading the goal"},
+            })
+
         profile = step(
             "finalize", "profile-generator (finalize)",
             lambda: profile_generator._finalize({"draft": draft}))
@@ -264,6 +300,7 @@ def run(payload):
         # aggregates[].role; it is a modelling choice, so it belongs here.
         "predictions": predictions,
         "engine_meta": engine_meta,
+        "llm": next((st.get("detail") for st in stages if st["id"] == "llm"), None),
         "compiled_run_config": next(
             (st.get("detail", {}).get("run_config") for st in stages
              if st["id"] == "compile" and isinstance(st.get("detail"), dict)),
