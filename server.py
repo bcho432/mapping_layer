@@ -240,7 +240,10 @@ def run(payload):
 
         profile = step(
             "finalize", "profile-generator (finalize)",
-            lambda: profile_generator._finalize({"draft": draft}))
+            # The schema rides along so finalize can check that every column a
+            # derive reads as a date actually holds one. It is the last gate a
+            # hand-edited profile passes, and the only one that has the values.
+            lambda: profile_generator._finalize({"draft": draft, "schema": schema}))
     if not isinstance(binding, dict):
         raise ValueError("no binding: the suggest step normally provides the stub")
 

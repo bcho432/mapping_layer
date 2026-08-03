@@ -389,6 +389,23 @@ class SpecCompilerService(BaseService):
     # ------------------------------------------------------------- the walk
 
     @staticmethod
+    def _clock_grain(profile):
+        """The clock's grain, wherever the profile spells it.
+
+        `task.clock.grain` is the current form and `profile.time.grain` the
+        legacy one. Three branches of _keys_of used to read this, and the one
+        that mattered most read only the legacy spelling: a univariate forecast
+        has NO entity keys, so it fell past both task-form branches into the
+        tail, which looked at profile.time, found nothing, and emitted no bin:
+        key -- leaving a clock that nothing binned. Every single-series forecast
+        failed to compile.
+        """
+        clock = task_field(profile, "clock")
+        if isinstance(clock, dict) and clock.get("grain"):
+            return str(clock["grain"]).strip().lower()
+        return str((profile.get("time") or {}).get("grain") or "").strip().lower()
+
+    @staticmethod
     def _keys_of(profile, naming):
         """The profile's keys, as a list, in a fixed order.
 
@@ -417,9 +434,7 @@ class SpecCompilerService(BaseService):
                 out.append({
                     "name": (("k_" + n) if multi else "series_id") if naming == "v1" else n,
                     "from": n, "via": "", "origin": f"task.keys = {n}"})
-            grain = str((task_field(profile, "clock") or {}).get("grain")
-                        if isinstance(task_field(profile, "clock"), dict)
-                        else (profile.get("time") or {}).get("grain") or "").strip().lower()
+            grain = SpecCompilerService._clock_grain(profile)
             if grain:
                 out.append({"name": "t" if naming == "v1" else "period",
                             "from": "", "via": "bin:" + grain,
@@ -464,8 +479,7 @@ class SpecCompilerService(BaseService):
             out.append({"name": "series_id" if naming == "v1" else series,
                         "from": series, "via": "",
                         "origin": f"profile.x-deep.series = {series}"})
-        time = profile.get("time") or {}
-        grain = str(time.get("grain") or "").strip().lower()
+        grain = SpecCompilerService._clock_grain(profile)
         if grain:
             out.append({"name": "t" if naming == "v1" else "period",
                         "from": "", "via": "bin:" + grain,
@@ -698,6 +712,21 @@ class SpecCompilerService(BaseService):
             if binned:
                 raise ValueError(
                     "the task declares no clock, but a key bins one")
+
+        # A kind that requires a clock requires somewhere to PROJECT INTO, and
+        # those are not the same statement. A clock with an event but no grain
+        # satisfies the catalog and lowers to `time_from` with no key binning it
+        # -- a forecast whose frame is `series_id | y`, with no axis to forecast
+        # along. `ordered` is what says the true thing, and it is declared per
+        # derive, so a `bin:fiscal_quarter` added tomorrow satisfies this with
+        # no edit here.
+        if "clock" in plan["requires"] and not any(
+                (dlib.get(str(k.get("via") or "").strip()) or {}).get("ordered")
+                for k in keys):
+            raise ValueError(
+                f"kind '{task['kind']}' has to project along a key, but no key in "
+                f"the SPEC is ordered — give the clock a grain so it lowers to a "
+                f"bin: key, or key on something with a successor")
 
         lo, hi = plan["keys_min"], plan["keys_max"]
         if not lo <= len(entity) <= hi:
@@ -1160,6 +1189,35 @@ class SpecCompilerService(BaseService):
                                "keys": ["category"],
                                "target": ["contract_concentration"]})
 
+        # ---- a forecast with no entity key at all --------------------------
+        # The shape every other test here has an entity key for, and the one
+        # that broke: with no keys the task-form branches of _keys_of are both
+        # skipped, so the grain has to be found by the branch that used to read
+        # only the legacy spelling. Airline, sunspots, births and melbourne are
+        # all this shape, and every one of them failed to compile. Caught by a
+        # dataset sweep rather than by these checks, which is what this is for.
+        uni = {"name": "airline",
+               "metrics": [{"name": "sum_pax", "function": "sum", "measure": "pax"}],
+               "task": {"kind": "forecast",
+                        "clock": {"event": "month", "grain": "month"},
+                        "target": "sum_pax"}}
+        uni_bind = {"source": "air", "bind": {"month": "Month", "pax": "Passengers"}}
+        uni_spec, _ = self._compile(uni, uni_bind)
+        checks["a univariate forecast compiles"] = (
+            uni_spec["keys"] == [{"name": "t", "via": "bin:month"}])
+        checks["a univariate forecast still binds its clock"] = (
+            uni_spec["time_from"] == "Month")
+        checks["a univariate frame has no series column"] = not any(
+            k.get("from") for k in uni_spec["keys"])
+        # the same question spelled the legacy way must reach the same SPEC
+        uni_flat, _ = self._compile(
+            {"name": "airline",
+             "metrics": [{"name": "sum_pax", "function": "sum",
+                          "measure": "pax", "role": "target"}],
+             "time": {"event": "month", "grain": "month"}}, uni_bind)
+        checks["both spellings agree with no keys"] = (
+            json.dumps(uni_flat) == json.dumps(uni_spec))
+
         # a covariate carries availability in the task, not on the metric
         native_cov = {
             "name": "sales", "version": "1",
@@ -1300,6 +1358,29 @@ class SpecCompilerService(BaseService):
                                     "covariates": [{"metric": "promo",
                                                     "availability": "someday"}]}},
             bind2, "availability must be one of")
+
+        # ---- a forecast needs a successor, not a clock ---------------------
+        # The rule used to be implied by "a grained clock lowers to a bin: key".
+        # A clock with an EVENT and no grain slipped through both: the catalog
+        # saw a clock, `_check` only demanded a bin key when a grain was set, and
+        # the frame came out `series_id | y` with nothing to project along.
+        checks["a clock with no grain is not a time axis"] = fails(
+            {"name": "p", "metrics": [{"name": "s", "function": "sum", "measure": "spend"}],
+             "dimensions": [{"name": "cust"}],
+             "task": {"kind": "forecast", "keys": ["cust"], "target": "s",
+                      "clock": {"event": "day"}}},
+            cross_bind, "no key in the SPEC is ordered")
+        checks["a grained clock still satisfies it"] = compiles(
+            "forecast", profile, binding) is not None
+        # `ordered` is not `returns == bucket`: both of these return a scalar off
+        # the bucket, and only one of them has a next value.
+        dl = derive_library.catalog()
+        checks["year is ordered, month_of_year is not"] = (
+            dl["year"]["ordered"] and not dl["month_of_year"]["ordered"]
+            and dl["year"]["returns"] == dl["month_of_year"]["returns"] == "scalar")
+        checks["a position key is not a sequence"] = not dl["row_number"]["ordered"]
+        checks["every bin: derive is ordered"] = all(
+            e["ordered"] for n, e in dl.items() if n.startswith("bin:"))
 
         # the catalogs must match their embedded fallbacks
         checks["task csv matches embedded fallback"] = (

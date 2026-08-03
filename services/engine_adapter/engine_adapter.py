@@ -230,15 +230,24 @@ class EngineAdapterService(BaseService):
         names = ((meta.get("classes") or {}).get(target) or {})
         label_of = (lambda v: names.get(str(int(v)), v)) if names else (lambda v: v)
 
+        # Three populations, and conflating them is why unlabelled rows used to
+        # come back with a null prediction:
+        #   scorable   a label AND complete features -> trains and is scored
+        #   to_predict no label, complete features   -> THE DELIVERABLE
+        #   incomplete a feature is missing          -> cannot be predicted at all
         rows, labels, keep = [], [], []
+        to_predict, incomplete = [], []
         for i, r in enumerate(frame):
             y = r.get(target)
             xs = [r.get(f) for f in feats]
-            if y is None or any(not _isnum(x) for x in xs):
-                continue
-            rows.append([float(x) for x in xs])
-            labels.append(label_of(y))
-            keep.append(i)
+            if any(not _isnum(x) for x in xs):
+                incomplete.append(i)
+            elif y is None:
+                to_predict.append(i)
+            else:
+                rows.append([float(x) for x in xs])
+                labels.append(label_of(y))
+                keep.append(i)
         if len(rows) < 4:
             raise ValueError(
                 f"only {len(rows)} rows have a label and complete features — "
@@ -266,6 +275,32 @@ class EngineAdapterService(BaseService):
                     "model": rc.get("model") or "random_forest",
                     "threshold": float(rc.get("threshold") or 0.5),
                     "class_weight": rc.get("class_weight") or "none"})
+        if to_predict:
+            acc["rows_predicted"] = len(to_predict)
+        if incomplete:
+            acc["rows_unscorable"] = len(incomplete)
+            acc["unscorable_reason"] = (
+                f"a feature was missing ({', '.join(feats[:3])}"
+                f"{'...' if len(feats) > 3 else ''})")
+
+        # The rows with no known outcome are the point of the exercise, so they
+        # get a model fitted on EVERY labelled row — not a cross-validation
+        # fold, which exists to estimate accuracy rather than to deliver an
+        # answer. They were previously reported with a null prediction, which
+        # was the one thing they must never be.
+        final, pred_out = None, {}
+        if to_predict:
+            final = classify.fit(
+                rows, labels,
+                n_trees=int(rc.get("trees") or classify.DEFAULT_TREES),
+                depth=int(rc.get("depth") or classify.DEFAULT_DEPTH),
+                class_weight=(rc.get("class_weight") or None))
+            thr = float(rc.get("threshold") or 0.5)
+            for i in to_predict:
+                xs = [float(frame[i].get(f)) for f in feats]
+                pred_out[i] = (classify.predict(final, xs, positive, thr),
+                               classify.predict_proba(final, xs))
+
 
         out = []
         for n, i in enumerate(keep):
@@ -277,16 +312,22 @@ class EngineAdapterService(BaseService):
             row["proba"] = round(p.get(positive, max(p.values(), default=0.0)), 4)
             row["is_prediction"] = "no"
             out.append(row)
-        # Rows the frame has but the model could not score — an absent label is
-        # the shape a genuine prediction takes, so they are reported, not hidden.
-        for i, r in enumerate(frame):
-            if i in set(keep):
-                continue
+        for i in to_predict:
+            r = frame[i]
             row = {k: r.get(k) for k in series_keys} or {cols[0]: r.get(cols[0])}
+            yh, p = pred_out[i]
             row[target] = None
+            row["yhat"] = yh
+            row["proba"] = round(p.get(positive, max(p.values(), default=0.0)), 4)
+            row["is_prediction"] = "yes"
+            out.append(row)
+        for i in incomplete:
+            r = frame[i]
+            row = {k: r.get(k) for k in series_keys} or {cols[0]: r.get(cols[0])}
+            row[target] = label_of(r[target]) if r.get(target) is not None else None
             row["yhat"] = None
             row["proba"] = None
-            row["is_prediction"] = "yes"
+            row["is_prediction"] = "unscorable"
             out.append(row)
         return out, acc
 

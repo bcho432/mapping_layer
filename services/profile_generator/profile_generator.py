@@ -42,8 +42,9 @@ from spl.core.base_service.base_service_class import BaseService
 from spl.core.service_types import ParameterEnum
 
 try:  # sibling modules: package-relative when deployed, flat when run locally
-    from . import function_library, task_library
+    from . import derive_library, function_library, task_library
 except ImportError:  # pragma: no cover
+    import derive_library
     import function_library
     import task_library
 
@@ -348,11 +349,29 @@ class ProfileGeneratorService(BaseService):
         if not date_col:
             if kind not in CLOCKED_KINDS:
                 return self._suggest_entity(cols, goal, goal_l, dataset, warnings, kind)
-            raise ValueError(
-                f"no time column found in the schema, but a '{kind}' needs one "
-                f"(a date/timestamp column). Kinds that need no clock: "
-                f"{', '.join(sorted(k for k in CLOCKLESS_KINDS if k != kind))} "
-                f"— say so in the goal.")
+
+            # This used to raise, and a raise here VETOES THE LANGUAGE MODEL.
+            # The scaffold always runs first and the LLM stage corrects its
+            # draft, so refusing at this point halts the pipeline before the
+            # model ever reads the sentence. `triage` reads "predict who will
+            # survive" as a forecast; the file has no clock; the run died --
+            # while the model, given any draft at all, names the label
+            # immediately. A keyword regex must not decide whether the reader
+            # gets to read.
+            #
+            # So demote to the clockless kind the data can actually support and
+            # say so. A wrong guess is one stage from being fixed; a refusal is
+            # not fixable at all.
+            text_lab, num_lab = self._label_candidates(cols)
+            demoted = "classify" if (text_lab or num_lab) else "regress"
+            warnings.append(
+                f"the goal reads as a '{kind}', but this file has no date "
+                f"column, so a clock is impossible; drafted a '{demoted}' "
+                f"instead -- say what you want in the goal")
+            if demoted == "classify":
+                return self._suggest_classify(cols, goal, goal_l, dataset, warnings)
+            return self._suggest_entity(cols, goal, goal_l, dataset, warnings,
+                                        demoted)
 
         # -- grain: explicit override, else goal keyword, else month -----
         grain = str(p.get("grain") or "").strip().lower()
@@ -540,6 +559,40 @@ class ProfileGeneratorService(BaseService):
 
     # ------------------------------------------------------- suggest: classify
 
+    def _label_candidates(self, cols):
+        """Columns that could plausibly hold a class label, best first.
+
+        Extracted so the classify scaffold and the no-clock demotion ask the
+        same question. Two rules that drifted apart would be worse than either:
+        the demotion would offer a classification the scaffold then could not
+        build.
+
+        Text first, then numerics whose VALUE SHAPE looks like a class id -- a
+        whole number from a small run. 71.78 is never a class, however few times
+        it appears, and counting distinct values conflated the two.
+        """
+        def few_values(c, hi):
+            n = c.get("cardinality")
+            return isinstance(n, (int, float)) and 1 < n <= hi
+
+        def looks_like_a_class(c):
+            sample = str(c.get("sample") or "").strip()
+            if not sample:
+                return False
+            try:
+                v = float(sample)
+            except ValueError:
+                return False
+            return v == int(v) and abs(v) < 1000
+
+        text = [c for c in cols
+                if not self._is_date(c) and not self._is_number(c)
+                and few_values(c, 20)]
+        numeric = [c for c in cols
+                   if self._is_number(c) and not self._is_date(c)
+                   and few_values(c, 20) and looks_like_a_class(c)]
+        return text, numeric
+
     def _suggest_classify(self, cols, goal, goal_l, dataset, warnings):
         """A labelled table: one row per thing, one categorical column to predict.
 
@@ -551,44 +604,7 @@ class ProfileGeneratorService(BaseService):
         """
         # The label: a categorical column with few distinct values. A column the
         # goal actually names wins, because that is the user being explicit.
-        def few_values(c, hi):
-            n = c.get("cardinality")
-            return isinstance(n, (int, float)) and 1 < n <= hi
-
-        def looks_like_a_class(c):
-            """Value SHAPE, not value count.
-
-            A class id is a whole number from a small contiguous run — 1..7, or
-            0/1. A measurement that happens to take few distinct values is not:
-            71.78 is never a class. Counting distinct values conflated the two,
-            and the count is the weaker signal of the two by far.
-            """
-            sample = str(c.get("sample") or "").strip()
-            if not sample:
-                return False
-            try:
-                v = float(sample)
-            except ValueError:
-                return False
-            return v == int(v) and abs(v) < 1000
-
-        cands = [c for c in cols
-                 if not self._is_date(c) and not self._is_number(c)
-                 and few_values(c, 20)]
-        # A 0/1 flag is the most common binary label there is, and it is numeric.
-        # Excluding numbers outright rejected every dataset that spells its
-        # label that way — pima, titanic, most churn exports. The bar is much
-        # tighter than for text: a numeric column is only a label candidate when
-        # it takes a handful of values, and it ranks below any text candidate.
-        # The cap was 5, which rejected any problem with six or more classes —
-        # glass, digits, most multi-class data. It is now loose enough that a
-        # real label always reaches the candidate list, because the cost of
-        # missing one is a HARD FAILURE: this runs before the LLM stage, so a
-        # refusal here stops the model ever seeing a draft to correct. Guessing
-        # badly is recoverable one stage later; refusing is not.
-        numeric_cands = [c for c in cols
-                         if self._is_number(c) and not self._is_date(c)
-                         and few_values(c, 20) and looks_like_a_class(c)]
+        cands, numeric_cands = self._label_candidates(cols)
         named = [c for c in (cands + numeric_cands) if c["name"].lower() in goal_l]
         pool = cands or numeric_cands
         if named:
@@ -984,6 +1000,14 @@ class ProfileGeneratorService(BaseService):
         _, kind, pointer, pointed = task_library.check(
             task, [m["name"] for m in norm_metrics], check_dims)
 
+        # A column is only a date because its VALUES are. Checked here, where a
+        # human is about to sign, rather than left to surface as an empty frame.
+        date_problems = self._check_dates(
+            task, draft_keys if isinstance(draft_keys, list) else [],
+            self._read_schema(p.get("schema")))
+        if date_problems:
+            raise ValueError("; ".join(date_problems))
+
         carried = {str(c.get("metric") or "").strip()
                    for c in (task.get("covariates") or []) if isinstance(c, dict)}
         for m in norm_metrics:
@@ -1008,6 +1032,68 @@ class ProfileGeneratorService(BaseService):
                      "and hand to spec-compiler (which re-checks the binding)."),
         }
         return profile, report
+
+    def _check_dates(self, task, keys, schema):
+        """Every column a derive reads as a date must actually hold dates.
+
+        The one check that catches a clock pointed at a column of prose. It is
+        generic because the requirement is DECLARED: `derive_library` says which
+        derives need a date, so `bin:fiscal_quarter` added tomorrow is covered
+        without touching this code.
+
+        Nothing else in the pipeline asks. A profile naming a text column as its
+        clock passed finalize with no warning, passed the compiler, and produced
+        an empty frame with every row counted under `bad_time` — the failure
+        arriving three stages after the decision that caused it, spelled as a
+        row count rather than as a name.
+
+        Only possible with the schema in hand, which is why finalize takes one.
+        Absent, the check is skipped rather than guessed at.
+        """
+        if not schema:
+            return []
+        sample = {}
+        for c in schema:
+            if isinstance(c, dict) and str(c.get("name") or "").strip():
+                sample[str(c["name"]).strip()] = c.get("sample")
+            elif isinstance(c, str):
+                sample[c.strip()] = None
+        if not sample:
+            return []
+
+        dlib = derive_library.catalog()
+        clock = task.get("clock") or {}
+        wanted = {}                      # logical column -> what wants a date
+
+        # A bucket derive reads the source's own event time; a scalar derive
+        # reads the bucket that bucket derive produced. Both lead back to the
+        # clock, so a graind clock is itself the claim being checked.
+        if clock.get("event") and clock.get("grain"):
+            wanted[str(clock["event"]).strip()] = f"the clock's {clock['grain']} grain"
+        for k in keys:
+            if not isinstance(k, dict):
+                continue
+            via = str(k.get("via") or "").strip()
+            entry = dlib.get(via)
+            if not entry or entry.get("needs") != "date":
+                continue
+            col = str(k.get("from") or "").strip() or str(clock.get("event") or "").strip()
+            if col:
+                wanted.setdefault(col, f"the '{via}' derive")
+
+        problems = []
+        for col, why in wanted.items():
+            if col not in sample:
+                continue                 # not a column we were given; not our call
+            val = sample[col]
+            if val in (None, ""):
+                continue                 # nothing to judge it on
+            if not _looks_like_date(val):
+                problems.append(
+                    f"'{col}' is read as a date by {why}, but its sample value "
+                    f"{str(val)!r} does not parse as one — the frame would come "
+                    f"back empty with every row counted as a bad timestamp")
+        return problems
 
     @staticmethod
     def _norm_clock(raw, where):
@@ -1168,6 +1254,19 @@ class ProfileGeneratorService(BaseService):
                 # ---- finalize input ----
                 SSP(key="draft", type="object",
                     description="finalize: the draft profile object to validate + normalize"),
+                SSP(key="schema", type="array",
+                    description=("finalize: the same columns given to suggest, optional. "
+                                 "Supplied, every column a derive reads as a date is "
+                                 "checked against its sample value — the only way to "
+                                 "catch a clock pointed at a column of prose before it "
+                                 "becomes an empty frame. Omitted, that check is "
+                                 "skipped, never guessed at."),
+                    properties=[
+                        SSP(key="name", type="string", required=True,
+                            description="Column name"),
+                        SSP(key="sample", type="string",
+                            description="Sample value; the date check reads this"),
+                    ]),
             ],
         )
 
@@ -1321,13 +1420,29 @@ class ProfileGeneratorService(BaseService):
         checks["recommend: scores a signal, not a target"] = (
             "signal" in rec["task"] and "target" not in rec["task"])
 
-        # ---- suggest edge: no time column is an error ----
+        # ---- suggest edge: no time column DEMOTES, it does not error ----
+        # This asserted a raise. Refusing here vetoes the language model: the
+        # scaffold always runs first and the LLM stage corrects its draft, so a
+        # raise halts the pipeline before the model reads the sentence at all.
+        # The contract is now "always emit a draft, and say what you demoted".
         try:
-            self._suggest({"goal": "sales", "schema": [{"name": "sales", "type": "number"}]})
-            checks["suggest without a time column errors"] = False
-        except ValueError as e:
-            checks["suggest without a time column errors"] = (
-                "time column" in str(e) and "cluster" in str(e))
+            prof_nc, rep_nc = self._suggest({
+                "goal": "predict who will survive",
+                "schema": [{"name": "fare", "type": "number", "sample": "7.25",
+                            "cardinality": 200},
+                           {"name": "survived", "type": "number", "sample": "1",
+                            "cardinality": 2},
+                           {"name": "pid", "type": "string", "sample": "p1",
+                            "cardinality": 300}]})
+            checks["no clock demotes instead of raising"] = True
+            checks["the demoted draft is clockless"] = (
+                "clock" not in (prof_nc.get("task") or {}))
+            checks["and it names the demotion"] = any(
+                "drafted a" in w for w in rep_nc.get("warnings", []))
+        except ValueError:
+            checks["no clock demotes instead of raising"] = False
+            checks["the demoted draft is clockless"] = False
+            checks["and it names the demotion"] = False
 
         # ---- suggest fallback: hhi asked for but no entity -> sum ----
         prof3, rep3 = self._suggest({
@@ -1447,7 +1562,67 @@ class ProfileGeneratorService(BaseService):
                 "time": {"event": "d", "grain": "week"}}})[1]["kind"]
             == "detect_anomaly")
 
+        # ---- a column is a date because its VALUES are ---------------------
+        # Nothing used to ask. A clock pointed at a column of prose passed
+        # finalize with no warning, passed the compiler, and came back as an
+        # empty frame with every row counted under `bad_time` — the failure
+        # arriving three stages after the decision, spelled as a row count
+        # rather than as a name. The requirement is declared in derive_library,
+        # so this one check covers every date-reading derive there will ever be.
+        date_schema = [{"name": "product", "sample": "shampoo"},
+                       {"name": "brand", "sample": "acme"},
+                       {"name": "amt", "sample": "3"},
+                       {"name": "order_dt", "sample": "2024-01-04"}]
+
+        def clocked(event):
+            return {"name": "p",
+                    "metrics": [{"name": "s", "function": "sum", "measure": "amt"}],
+                    "dimensions": [{"name": "brand"}],
+                    "task": {"kind": "forecast", "keys": ["brand"], "target": "s",
+                             "clock": {"event": event, "grain": "month"}}}
+
+        def finalizes(d, sch):
+            try:
+                self._finalize({"draft": d, "schema": sch})
+                return True, ""
+            except ValueError as e:
+                return False, str(e)
+
+        ok_text, why = finalizes(clocked("product"), date_schema)
+        checks["a clock over a text column is rejected"] = (
+            not ok_text and "does not parse" in why)
+        checks["and the message names the column and the sample"] = (
+            "'product'" in why and "shampoo" in why)
+        checks["a clock over a real date is accepted"] = (
+            finalizes(clocked("order_dt"), date_schema)[0])
+        checks["with no schema the check is skipped, not guessed"] = (
+            finalizes(clocked("product"), None)[0])
+
+        # the rule is read off the derive, so it covers more than the clock
+        def scalar_key(col):
+            return {"name": "p",
+                    "metrics": [{"name": "s", "function": "sum", "measure": "amt"}],
+                    "dimensions": [{"name": "brand"}, {"name": "product"},
+                                   {"name": "order_dt"}],
+                    "keys": [{"name": "k_b", "from": "brand"},
+                             {"name": "moy", "from": col, "via": "month_of_year"}],
+                    "task": {"kind": "regress", "target": "s"}}
+
+        ok_scalar, why_scalar = finalizes(scalar_key("product"), date_schema)
+        checks["a date-needing derive over a text column is rejected"] = (
+            not ok_scalar and "month_of_year" in why_scalar)
+        checks["the same derive over a date column is accepted"] = (
+            finalizes(scalar_key("order_dt"), date_schema)[0])
+        # row_number needs nothing, so it is never asked for a date
+        checks["a position key is never asked for a date"] = (
+            derive_library.catalog()["row_number"]["needs"] == "")
+        checks["every bin: derive declares that it needs one"] = all(
+            e["needs"] == "date" for n, e in derive_library.catalog().items()
+            if n.startswith("bin:"))
+
         # the catalogs must match their embedded fallbacks
+        checks["derive csv matches embedded fallback"] = (
+            derive_library.catalog() == derive_library.embedded_catalog())
         checks["function csv matches embedded fallback"] = (
             function_library.catalog() == function_library.embedded_catalog())
         checks["task csv matches embedded fallback"] = (

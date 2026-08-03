@@ -31,18 +31,31 @@ from datetime import date, timedelta
 CATALOG_FILENAME = "derive_library.csv"
 
 # Keep identical to derive_library.csv - the self_test asserts they match.
-_EMBEDDED_CATALOG = """derive,scope,returns,description
-bin:day,key,bucket,Bin a date into one calendar day
-bin:week,key,bucket,Bin a date into one ISO week
-bin:month,key,bucket,Bin a date into one calendar month
-bin:quarter,key,bucket,Bin a date into one calendar quarter
-bin:year,key,bucket,Bin a date into one calendar year
-week_of_year,key,scalar,ISO week number of the bucket
-month_of_year,key,scalar,Calendar month number of the bucket
-quarter_of_year,key,scalar,Calendar quarter number of the bucket
-day_of_week,key,scalar,ISO weekday of the bucket (Monday is 1)
-year,key,scalar,Calendar year of the bucket
-row_number,key,position,Each input row becomes its own frame row - for data that is already one row per thing
+# `needs` is what the derive reads, and it is the whole basis of the one check
+# that catches a clock pointed at a column of prose. A derive that needs a date
+# is a promise about the DATA, not about the profile: no amount of correct
+# authoring makes `bin:month` work over a column holding "shampoo".
+# `ordered` is whether this derive's values form a sequence with a successor --
+# whether "what comes next" is a question about the key at all. It is what a
+# forecast actually requires: not time, but somewhere to project into.
+#
+# It is NOT the same as `returns: bucket`, and `year` is why. Both `year` and
+# `month_of_year` return a scalar off the bucket, but 2024 is followed by 2025
+# while December is followed by a January belonging to a different year. One can
+# be forecast along and the other cannot, and this column is the only place that
+# difference can be written down.
+_EMBEDDED_CATALOG = """derive,scope,returns,needs,ordered,description
+bin:day,key,bucket,date,yes,Bin a date into one calendar day
+bin:week,key,bucket,date,yes,Bin a date into one ISO week
+bin:month,key,bucket,date,yes,Bin a date into one calendar month
+bin:quarter,key,bucket,date,yes,Bin a date into one calendar quarter
+bin:year,key,bucket,date,yes,Bin a date into one calendar year
+week_of_year,key,scalar,date,no,ISO week number of the bucket - cyclic
+month_of_year,key,scalar,date,no,Calendar month number of the bucket - cyclic
+quarter_of_year,key,scalar,date,no,Calendar quarter number of the bucket - cyclic
+day_of_week,key,scalar,date,no,ISO weekday of the bucket (Monday is 1) - cyclic
+year,key,scalar,date,yes,Calendar year of the bucket
+row_number,key,position,,no,Each input row becomes its own frame row - position is not a sequence
 """
 
 # The grains a bin: derive understands, in the order the old GRAINS tuple had.
@@ -110,6 +123,8 @@ def _parse_catalog(text):
         out[name] = {
             "scope": (r.get("scope") or "").strip(),
             "returns": (r.get("returns") or "").strip(),
+            "needs": (r.get("needs") or "").strip(),
+            "ordered": (r.get("ordered") or "").strip().lower() == "yes",
             "description": (r.get("description") or "").strip(),
         }
     return out
