@@ -99,6 +99,24 @@ CONTRACT = {
 KINDS = tuple(CONTRACT)
 
 
+def task_field(profile, field, default=None):
+    """Read a question-shaped field from `profile.task`, or the top level.
+
+    The profile splits in two: `task` is what is being asked (the kind, and
+    what identifies a row), and everything else describes the data. Both
+    shapes are accepted — a flat profile is the original vocabulary and still
+    compiles unchanged — so the split can be adopted, or backed out, without a
+    migration. Deliberately NOT gated on `version`: gating catches a typo like
+    "tsak" that would otherwise read as a flat profile with no kind, but it
+    also commits to a schema before anyone has lived with it.
+    """
+    t = profile.get("task")
+    if isinstance(t, dict) and field in t:
+        return t[field]
+    return profile.get(field, default)
+
+
+
 # --------------------------------------------------------------- the machinery
 
 @dataclass(frozen=True)
@@ -245,7 +263,7 @@ class SpecCompilerService(BaseService):
         an x-deep series becomes one key, and a time grain becomes a bin: key.
         Nothing downstream can tell which form was authored.
         """
-        raw = profile.get("keys")
+        raw = task_field(profile, "keys")
         if isinstance(raw, list) and raw:
             out = []
             for i, k in enumerate(raw):
@@ -256,11 +274,19 @@ class SpecCompilerService(BaseService):
                 via = str(k.get("via") or "").strip()
                 if not name:
                     raise ValueError(f"profile.keys[{i}].name is required")
-                if via:
-                    derive_library.resolve(via, f"profile.keys[{i}].via")
-                if not frm and not via.startswith("bin:"):
+                entry = derive_library.resolve(via, f"profile.keys[{i}].via") \
+                    if via else None
+                # Which derives may omit `from` is a property of the derive, not
+                # a prefix on its name: a bin: spine reads the source's own event
+                # time, and a position key reads the row's index. Matching on the
+                # string "bin:" made that a naming convention rather than a fact
+                # the library states about itself.
+                self_supplying = bool(entry) and entry["returns"] in ("bucket",
+                                                                      "position")
+                if not frm and not self_supplying:
                     raise ValueError(
-                        f"profile.keys[{i}] needs a 'from' (only a bin: key may omit it)")
+                        f"profile.keys[{i}] needs a 'from' (only a key whose "
+                        f"derive supplies its own value may omit it)")
                 out.append({"name": name, "from": frm, "via": via,
                             "origin": f"profile.keys[{i}] = {name}"})
             return out
@@ -502,7 +528,7 @@ class SpecCompilerService(BaseService):
         version = str(profile.get("version") or "").strip()
         report["profile"] = f"{name} v{version}".strip() if name else "(unnamed profile)"
 
-        kind = str(profile.get("kind") or "forecast").strip().lower()
+        kind = str(task_field(profile, "kind") or "forecast").strip().lower()
         if kind not in CONTRACT:
             raise ValueError(f"profile.kind must be one of {sorted(CONTRACT)}, got '{kind}'")
         report["kind"] = kind

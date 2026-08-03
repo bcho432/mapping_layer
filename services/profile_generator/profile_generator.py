@@ -58,6 +58,23 @@ _ENTITYISH = re.compile(r"(vendor|recipient|parent|supplier|customer|company|"
 # CONTRACT table: forecast and anomaly require time_from; the rest permit or
 # forbid it.
 CLOCKED_KINDS = ("forecast", "anomaly")
+
+def task_field(profile, field, default=None):
+    """Read a question-shaped field from `profile.task`, or the top level.
+
+    The profile splits in two: `task` is what is being asked (the kind, and
+    what identifies a row), and everything else describes the data. Both
+    shapes are accepted — a flat profile is the original vocabulary and still
+    compiles unchanged — so the split can be adopted, or backed out, without a
+    migration. Deliberately NOT gated on `version`: gating catches a typo like
+    "tsak" that would otherwise read as a flat profile with no kind, but it
+    also commits to a schema before anyone has lived with it.
+    """
+    t = profile.get("task")
+    if isinstance(t, dict) and field in t:
+        return t[field]
+    return profile.get(field, default)
+
 KNOWN_KINDS = ("forecast", "anomaly", "classify", "cluster", "regress",
                "recommend", "rank")
 
@@ -65,6 +82,11 @@ _RECOMMENDISH = re.compile(
     r"(recommend|suggest.*(item|product|movie|title|track|article)|"
     r"what should|who should|similar (items?|products?)|"
     r"personalis|personaliz|cross[- ]sell|up[- ]sell|next best)", re.I)
+_CLASSIFYISH = re.compile(
+    r"(classif|categoris|categoriz|which (category|class|type|group|kind)|"
+    r"predict (whether|if|which)|at risk|risk of|churn|fraud|spam|"
+    r"flag (which|the)|label|will .* (leave|withdraw|default|fail|cancel|convert))",
+    re.I)
 _DIMISH = re.compile(r"(category|type|class|region|state|store|segment|group|"
                      r"naics|sector|dept|department|channel|product|market|branch)", re.I)
 _NUMTYPES = ("number", "numeric", "integer", "int", "float", "double", "decimal", "money")
@@ -149,9 +171,17 @@ class ProfileGeneratorService(BaseService):
         # valid interaction log being rejected as "not forecastable".
         kind = str(p.get("kind") or "").strip().lower()
         if not kind:
-            kind = ("recommend" if _RECOMMENDISH.search(goal_l) else "forecast")
+            # Recommendation is checked first: "suggest which items" is a
+            # recommendation even though it also matches "which". Forecasting
+            # stays the default, because it is the only kind whose absence of a
+            # keyword is meaningful — a plain "monthly sales" is a forecast.
+            kind = ("recommend" if _RECOMMENDISH.search(goal_l)
+                    else "classify" if _CLASSIFYISH.search(goal_l)
+                    else "forecast")
         if kind == "recommend":
             return self._suggest_recommend(cols, goal, goal_l, dataset, warnings)
+        if kind == "classify":
+            return self._suggest_classify(cols, goal, goal_l, dataset, warnings)
 
         # -- time column (no forecasting without one) --------------------
         date_col = self._pick(cols, self._is_date)
@@ -252,6 +282,153 @@ class ProfileGeneratorService(BaseService):
         }
         return profile, report
 
+    # ------------------------------------------------------- suggest: classify
+
+    def _suggest_classify(self, cols, goal, goal_l, dataset, warnings):
+        """A labelled table: one row per thing, one categorical column to predict.
+
+        Deliberately a weak draft rather than a clever one. Mapping "at risk of
+        withdrawing" to a column called WITHDRAWN_FLAG is exactly the judgment a
+        keyword table cannot make and a model can, so this picks a defensible
+        floor and leaves the reading to the LLM stage — the same division that
+        stopped `market fragmentation` needing a synonym entry for `hhi`.
+        """
+        # The label: a categorical column with few distinct values. A column the
+        # goal actually names wins, because that is the user being explicit.
+        def few_values(c, hi):
+            n = c.get("cardinality")
+            return isinstance(n, (int, float)) and 1 < n <= hi
+
+        def looks_like_a_class(c):
+            """Value SHAPE, not value count.
+
+            A class id is a whole number from a small contiguous run — 1..7, or
+            0/1. A measurement that happens to take few distinct values is not:
+            71.78 is never a class. Counting distinct values conflated the two,
+            and the count is the weaker signal of the two by far.
+            """
+            sample = str(c.get("sample") or "").strip()
+            if not sample:
+                return False
+            try:
+                v = float(sample)
+            except ValueError:
+                return False
+            return v == int(v) and abs(v) < 1000
+
+        cands = [c for c in cols
+                 if not self._is_date(c) and not self._is_number(c)
+                 and few_values(c, 20)]
+        # A 0/1 flag is the most common binary label there is, and it is numeric.
+        # Excluding numbers outright rejected every dataset that spells its
+        # label that way — pima, titanic, most churn exports. The bar is much
+        # tighter than for text: a numeric column is only a label candidate when
+        # it takes a handful of values, and it ranks below any text candidate.
+        # The cap was 5, which rejected any problem with six or more classes —
+        # glass, digits, most multi-class data. It is now loose enough that a
+        # real label always reaches the candidate list, because the cost of
+        # missing one is a HARD FAILURE: this runs before the LLM stage, so a
+        # refusal here stops the model ever seeing a draft to correct. Guessing
+        # badly is recoverable one stage later; refusing is not.
+        numeric_cands = [c for c in cols
+                         if self._is_number(c) and not self._is_date(c)
+                         and few_values(c, 20) and looks_like_a_class(c)]
+        named = [c for c in (cands + numeric_cands) if c["name"].lower() in goal_l]
+        pool = cands or numeric_cands
+        if named:
+            label = named[0]
+        elif pool:
+            label = min(pool, key=lambda c: (c["cardinality"], c["name"]))
+            if pool is numeric_cands:
+                warnings.append(
+                    f"'{label['name']}' is numeric but its values look like "
+                    f"class ids ({int(label['cardinality'])} of them), so it "
+                    f"was read as a label rather than something to measure")
+            # A tie between look-alike columns is a coin flip, and saying so is
+            # the difference between a draft you check and one you trust.
+            rivals = [c["name"] for c in pool
+                      if c["name"] != label["name"]
+                      and c["cardinality"] == label["cardinality"]]
+            if rivals:
+                warnings.append(
+                    f"'{label['name']}' was picked as the label, but "
+                    f"{', '.join(repr(r) for r in rivals[:3])} "
+                    f"{'is' if len(rivals) == 1 else 'are'} equally "
+                    f"label-shaped — name the one you mean in the goal")
+        else:
+            # Still no candidate: emit the weakest possible draft rather than
+            # refusing, so the LLM stage gets something to correct. The warning
+            # is the honest signal; a raise here would end the run.
+            fallback = next((c for c in reversed(cols)
+                             if not self._is_date(c)), cols[-1])
+            label = fallback
+            warnings.append(
+                f"no column looks like a class label; fell back to "
+                f"'{label['name']}' (the last non-date column). This is a "
+                f"guess — say which column holds the label in the goal")
+
+        feats = [c for c in cols
+                 if self._is_number(c) and not self._is_date(c)
+                 and c["name"] != label["name"]]
+        if not feats:
+            raise ValueError(
+                f"no numeric columns to learn from — '{label['name']}' looks "
+                f"like a label but nothing measurable accompanies it")
+
+        # The key: a real identifier if the file has one, otherwise each row is
+        # already the thing being classified and its position is its identity.
+        ident = next((c for c in cols
+                      if c["name"] != label["name"]
+                      and _ENTITYISH.search(c["name"])
+                      and isinstance(c.get("cardinality"), (int, float))
+                      and c["cardinality"] > 1), None)
+        if ident:
+            keys = [{"name": f"k_{ident['name']}", "from": ident["name"]}]
+            dims = [{"name": ident["name"]}]
+        else:
+            keys = [{"name": "k_row", "via": "row_number"}]
+            dims = []
+            warnings.append(
+                "no id column found, so each input row becomes one frame row "
+                "(key 'row_number'); if rows should be grouped, name the "
+                "column that groups them")
+
+        metrics = [{"name": f"label_{label['name']}", "function": "label",
+                    "role": "target", "measure": label["name"]}]
+        for c in feats:
+            metrics.append({"name": f"mean_{c['name']}", "function": "mean",
+                            "role": "feature", "measure": c["name"]})
+
+        profile = {
+            "name": self._slug(goal) or dataset,
+            "version": "1",
+            "kind": "classify",
+            "datasets": [{"name": dataset}],
+            "keys": keys,
+            "metrics": metrics,
+            "dimensions": dims,
+        }
+        bound = [label["name"]] + [c["name"] for c in feats]
+        if ident:
+            bound.append(ident["name"])
+        binding_stub = {"source": dataset,
+                        "bind": {n: n for n in dict.fromkeys(bound)},
+                        "available_from": ""}
+        report = {
+            "mode": "suggest", "goal": goal, "kind": "classify",
+            "chose": {"label": label["name"],
+                      "classes": label.get("cardinality"),
+                      "key": ident["name"] if ident else "row_number",
+                      "features": [c["name"] for c in feats]},
+            "binding_stub": binding_stub,
+            "warnings": warnings,
+            "note": ("The label is the non-numeric column with the fewest "
+                     "distinct values, and every other numeric column is a "
+                     "feature. That is a floor, not a reading of the goal — "
+                     "check it, or let the model correct it."),
+        }
+        return profile, report
+
     # ------------------------------------------------------ suggest: recommend
 
     def _suggest_recommend(self, cols, goal, goal_l, dataset, warnings):
@@ -340,7 +517,7 @@ class ProfileGeneratorService(BaseService):
         # Only a question with a clock needs one. Demanding `time.event` of
         # every profile rejected recommendation outright, which keys a user x
         # item grid and has no time axis at all.
-        kind = str(draft.get("kind") or "forecast").strip().lower()
+        kind = str(task_field(draft, "kind") or "forecast").strip().lower()
         time = draft.get("time")
         has_time = isinstance(time, dict) and str(time.get("event") or "").strip()
         if kind in CLOCKED_KINDS and not has_time:
@@ -428,14 +605,20 @@ class ProfileGeneratorService(BaseService):
             "metrics": norm_metrics,
             "dimensions": [{"name": d} for d in dim_names],
         }
-        if kind != "forecast":
-            profile["kind"] = kind
+        # Always stated, never implied. `forecast` is the compiler's default, so
+        # omitting it compiled identically — but the profile is the document a
+        # human reads and signs, and absence there is ambiguous: it cannot be
+        # told apart from a kind that failed to be set, and it leaves nothing to
+        # edit when you want to change the question.
+        task = {"kind": kind}
         if has_time:
             profile["time"] = {"event": str(time["event"]).strip(), "grain": grain}
         # An explicit keys[] is the general form and must survive finalize —
         # it is the only way a clockless question names its axes.
-        if isinstance(draft.get("keys"), list) and draft["keys"]:
-            profile["keys"] = draft["keys"]
+        draft_keys = task_field(draft, "keys")
+        if isinstance(draft_keys, list) and draft_keys:
+            task["keys"] = draft_keys
+        profile["task"] = task
         if series:
             profile["x-deep"] = {"series": series}
 

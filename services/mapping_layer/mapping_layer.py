@@ -258,11 +258,16 @@ class MappingLayerService(BaseService):
                         f"a key needs a key-scope derive")
                 vkind = entry["returns"]
             is_spine = vkind == "bucket" and not raw_from
-            if not is_spine and not raw_from:
+            # A position key identifies a row by where it sits, so it has no
+            # source column to declare — the same exemption a bin: spine gets.
+            if vkind == "position":
+                raw_from = ""
+            elif not is_spine and not raw_from:
                 raise ValueError(
                     f"keys[{i}].from is required (only a bin: key may omit it, "
                     f"to bin each source's own event time)")
-            ksrc, kcol = (None, "") if is_spine else split(raw_from, f"keys[{i}].from")
+            ksrc, kcol = ((None, "") if (is_spine or vkind == "position")
+                          else split(raw_from, f"keys[{i}].from"))
             keys.append({
                 "name": name, "source": ksrc, "column": kcol, "via": via,
                 "vkind": vkind, "spine": is_spine,
@@ -473,10 +478,12 @@ class MappingLayerService(BaseService):
         buckets = {}
         refiled = 0
 
+        n_seen = -1
         for row in rows:
             if not isinstance(row, dict):
                 dropped["not_a_row"] += 1
                 continue
+            n_seen += 1
             if spec["multi"]:
                 src = src_by_id.get(str(row.get(spec["source_from"]) or "").strip())
                 if src is None:
@@ -505,7 +512,7 @@ class MappingLayerService(BaseService):
                     if da is not None:
                         av_lab, av_sort = derive_library.apply_bucket(via, da)
 
-            built = self._key_tuple(row, keys, src, ev_lab, ev_sort)
+            built = self._key_tuple(row, keys, src, ev_lab, ev_sort, n_seen)
             if built is None:
                 dropped["bad_time"] += 1
                 continue
@@ -541,6 +548,17 @@ class MappingLayerService(BaseService):
                 elif f["fn"] == "count" and not f["column"]:
                     fb["mv"].setdefault(f["name"], []).append(1.0)
                     moved = True
+                elif f["fn"] in function_library.CATEGORICAL_REDUCTIONS:
+                    # The only path that does not coerce to a number. A class
+                    # label is text by nature, and running it through
+                    # _parse_number is exactly how the target column used to
+                    # come back empty on every row while the frame still
+                    # reported success.
+                    raw = row.get(f["column"])
+                    raw = "" if raw is None else str(raw).strip()
+                    if raw:
+                        fb["mv"].setdefault(f["name"], []).append(raw)
+                        moved = True
                 else:
                     fv = self._parse_number(row.get(f["column"]))
                     if fv is not None:
@@ -572,7 +590,8 @@ class MappingLayerService(BaseService):
             got_any = False
             for m in spec["measures"]:
                 v = self._reduce(m["fn"], m["kind"], pick("mv", m["name"], b, extras))
-                out[m["out"]] = round(v, 6) if v is not None else None
+                out[m["out"]] = (v if isinstance(v, str)
+                                 else round(v, 6) if v is not None else None)
                 got_any = got_any or v is not None
             for d in spec["derived"]:
                 out[d["out"]] = derive_library.apply_scalar(
@@ -608,11 +627,30 @@ class MappingLayerService(BaseService):
                 frame.append(out)
         broadcast_unmatched = len(bcast) - len(matched_b)
 
+        # Categories become integer class ids only once the whole frame exists:
+        # an id assigned per bucket would differ between buckets, and an id
+        # assigned in first-seen order would move when the rows do. Sorting the
+        # distinct labels makes the mapping a function of the DATA, not of the
+        # order it arrived in, so two runs of the same file agree.
+        classes = {}
+        for m in spec["measures"]:
+            if m["fn"] not in function_library.CATEGORICAL_REDUCTIONS:
+                continue
+            seen = sorted({r[m["out"]] for r in frame
+                           if isinstance(r.get(m["out"]), str)})
+            ids = {name: i for i, name in enumerate(seen)}
+            for r in frame:
+                if isinstance(r.get(m["out"]), str):
+                    r[m["out"]] = float(ids[r[m["out"]]])
+            if seen:
+                classes[m["out"]] = {str(i): name for name, i in ids.items()}
+
         spine_set = set(spine)
         non_spine = [i for i in range(len(keys)) if i not in spine_set]
         meta = {
             "rows_in": len(rows),
             "rows_dropped": dropped,
+            **({"classes": classes} if classes else {}),
             "frame_rows": len(frame),
             "series_count": (
                 len({tuple(r[keys[i]["name"]] for i in non_spine) for r in frame})
@@ -639,6 +677,22 @@ class MappingLayerService(BaseService):
         # join. The old rule keyed this off "more than one target", which is not
         # expressible now that role has moved to the run config — and was never
         # quite what it meant anyway.
+        # A position key puts exactly one input row in every bucket, so any
+        # aggregate degenerates: count is always 1, and mean/min/max all return
+        # that single row's value. That is correct for data already shaped one
+        # row per thing, and a mistake for data that needed grouping — so it is
+        # reported rather than assumed either way.
+        if any(k["vkind"] == "position" for k in keys):
+            meta["row_number_key"] = {
+                "buckets": len(frame),
+                "rows_kept": sum(src_counts.values()) - sum(dropped.values()),
+                "note": ("each input row became its own frame row; aggregates "
+                         "fold a single value, so count() is always 1"),
+            }
+            degenerate = [m["out"] for m in spec["measures"] if m["fn"] == "count"]
+            if degenerate:
+                meta["row_number_key"]["always_one"] = degenerate
+
         if any(gaps.values()):
             meta["nulls_per_measure"] = {k: v for k, v in gaps.items() if v}
         if spec["multi"]:
@@ -651,7 +705,7 @@ class MappingLayerService(BaseService):
 
     # -------------------------------------------------------------- helpers
 
-    def _key_tuple(self, row, keys, src, ev_lab, ev_sort):
+    def _key_tuple(self, row, keys, src, ev_lab, ev_sort, position=0):
         """Build one bucket key: (labels, sort values), or None if unparseable.
 
         A key whose column this row's source does not carry gets the _BCAST
@@ -674,6 +728,12 @@ class MappingLayerService(BaseService):
                 if d is None:
                     return None
                 lab = srt = derive_library.apply_scalar(k["via"], d)
+            elif k["vkind"] == "position":
+                # Position, not identity. Reordering the input renames every
+                # row, so this is only honest for a file that is already one
+                # row per thing and has no id column of its own — iris, wine,
+                # a transaction log. Prefer a real id whenever one exists.
+                lab = srt = k["prefix"] + f"r{position:06d}"
             else:
                 raw = row.get(k["column"])
                 raw = "" if raw is None else str(raw).strip()
@@ -761,6 +821,18 @@ class MappingLayerService(BaseService):
     def _agg(metric, vals):
         if metric == "count":
             return float(len(vals))
+        if metric == "label":
+            # The bucket's most common category, ties broken by name so the
+            # answer does not depend on row order. Returned as a STRING here;
+            # the emit pass turns it into an integer class id once every
+            # bucket's label is known, which is the only way ids can be
+            # consistent across the whole frame.
+            if not vals:
+                return None
+            counts = {}
+            for v in vals:
+                counts[v] = counts.get(v, 0) + 1
+            return min(counts, key=lambda k: (-counts[k], k))
         if not vals:
             return None
         if metric == "sum":

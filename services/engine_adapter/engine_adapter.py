@@ -46,8 +46,9 @@ from spl.core.base_service.base_service_class import BaseService
 from spl.core.service_types import ParameterEnum
 
 try:  # sibling modules: package-relative when deployed, flat when run locally
-    from . import ets, recommend
+    from . import classify, ets, recommend
 except ImportError:  # pragma: no cover
+    import classify
     import ets
     import recommend
 
@@ -64,6 +65,8 @@ TASK_KNOBS = {
                   "quantiles", "backtest"],
     "recommend": ["target", "top_k", "holdout", "folds",
                   "user_key", "item_key"],
+    "classify":  ["target", "features", "model", "folds", "trees", "depth",
+                  "class_weight", "positive_class", "threshold"],
 }
 
 # grain -> how many buckets make one cycle. A season length that disagrees with
@@ -137,8 +140,9 @@ class EngineAdapterService(BaseService):
         season = int(rc.get("season_length") or 0) or None
         grain = meta.get("grain")
 
+        kind = str(rc.get("kind") or "").strip().lower()
         warnings, checks = self._compat(engine, clock, series_keys, horizon,
-                                        season, grain, frame, target)
+                                        season, grain, frame, target, kind)
 
         report = {
             "engine": engine, "mode": mode,
@@ -159,6 +163,24 @@ class EngineAdapterService(BaseService):
                 f"prepared only — POST `data` to {engine}. Nothing was fitted "
                 f"here; set engine 'local' to fit stdlib exponential smoothing.")
             return payload, report
+
+        # The profile already said what question this is, and the compiler put
+        # it in the run config. Reading it is more honest than re-deriving it
+        # from the frame's shape — a classification and a clustering frame look
+        # identical apart from a column, and guessing between them is exactly
+        # the kind of inference this pipeline exists to avoid.
+        if str(rc.get("kind") or "").strip().lower() == "classify" and not clock:
+            preds, accuracy = self._run_classify(frame, series_keys, target,
+                                                 features, rc, meta)
+            report["task"] = "classify"
+            report["knobs"] = TASK_KNOBS["classify"]
+            report["ignored_knobs"] = sorted(
+                k for k in rc
+                if k not in TASK_KNOBS["classify"] + ["engine", "kind"]
+                and rc[k] not in (None, "", [], {}))
+            report["accuracy"] = accuracy
+            report["verdict"] = classify.verdict(accuracy)
+            return preds, report
 
         # A grid of two entity keys and no clock is a recommendation, not a
         # forecast. The frame says which of the two it is; nothing else has to.
@@ -185,6 +207,88 @@ class EngineAdapterService(BaseService):
         report["accuracy"] = accuracy
         report["verdict"] = self._verdict(accuracy)
         return preds, report
+
+    # ---------------------------------------------------- local classifier
+
+    def _run_classify(self, frame, series_keys, target, features, rc, meta):
+        """Random forest over the frame's feature columns, scored by k-fold.
+
+        The frame carries integer class ids, because it is a numeric matrix by
+        construction; `frame_meta.classes` carries the names. Predictions are
+        mapped back to names on the way out, so the engine works in ids and the
+        reader sees labels.
+        """
+        cols = list(frame[0].keys())
+        feats = [c for c in (features or [])
+                 if c in cols and c != target and c not in series_keys]
+        if not feats:
+            feats = [c for c in cols if c != target and c not in series_keys]
+        if not feats:
+            raise ValueError("no feature columns: a classifier needs something "
+                             "to learn from besides the label")
+
+        names = ((meta.get("classes") or {}).get(target) or {})
+        label_of = (lambda v: names.get(str(int(v)), v)) if names else (lambda v: v)
+
+        rows, labels, keep = [], [], []
+        for i, r in enumerate(frame):
+            y = r.get(target)
+            xs = [r.get(f) for f in feats]
+            if y is None or any(not _isnum(x) for x in xs):
+                continue
+            rows.append([float(x) for x in xs])
+            labels.append(label_of(y))
+            keep.append(i)
+        if len(rows) < 4:
+            raise ValueError(
+                f"only {len(rows)} rows have a label and complete features — "
+                f"too few to fit and score a classifier")
+
+        positive = str(rc.get("positive_class") or "").strip() or None
+        if positive is not None and positive not in set(labels):
+            raise ValueError(
+                f"positive_class {positive!r} is not one of the labels "
+                f"({', '.join(sorted(set(labels)))})")
+
+        res, why = classify.evaluate(
+            rows, labels,
+            k=int(rc.get("folds") or 5),
+            n_trees=int(rc.get("trees") or classify.DEFAULT_TREES),
+            depth=int(rc.get("depth") or classify.DEFAULT_DEPTH),
+            class_weight=(rc.get("class_weight") or None),
+            positive=positive,
+            threshold=float(rc.get("threshold") or 0.5))
+        if res is None:
+            raise ValueError(why)
+
+        acc = classify.score(labels, res["pred"], res["proba"], positive=positive)
+        acc.update({"folds": res["folds"], "features": feats,
+                    "model": rc.get("model") or "random_forest",
+                    "threshold": float(rc.get("threshold") or 0.5),
+                    "class_weight": rc.get("class_weight") or "none"})
+
+        out = []
+        for n, i in enumerate(keep):
+            r = frame[i]
+            row = {k: r.get(k) for k in series_keys} or {cols[0]: r.get(cols[0])}
+            row[target] = labels[n]
+            row["yhat"] = res["pred"][n]
+            p = res["proba"][n] or {}
+            row["proba"] = round(p.get(positive, max(p.values(), default=0.0)), 4)
+            row["is_prediction"] = "no"
+            out.append(row)
+        # Rows the frame has but the model could not score — an absent label is
+        # the shape a genuine prediction takes, so they are reported, not hidden.
+        for i, r in enumerate(frame):
+            if i in set(keep):
+                continue
+            row = {k: r.get(k) for k in series_keys} or {cols[0]: r.get(cols[0])}
+            row[target] = None
+            row["yhat"] = None
+            row["proba"] = None
+            row["is_prediction"] = "yes"
+            out.append(row)
+        return out, acc
 
     # ---------------------------------------------------- local recommender
 
@@ -275,23 +379,30 @@ class EngineAdapterService(BaseService):
 
     # ------------------------------------------------------- compatibility
 
+    # Kinds with no time axis. Running the clock checks on one produces true
+    # statements about the wrong question — "no key is a clock, so a horizon
+    # means nothing" is not a warning to someone who never asked for a horizon.
+    CLOCKLESS = ("classify", "cluster", "recommend", "rank", "regress")
+
     def _compat(self, engine, clock, series_keys, horizon, season, grain,
-                frame, target):
+                frame, target, kind=""):
         """The checks the browser was doing, with the data now in hand."""
         checks, warnings = [], []
+        clocked = kind not in self.CLOCKLESS
 
         def ok(label, good, detail=""):
             checks.append({"check": label, "ok": bool(good), "detail": detail})
             if not good:
                 warnings.append(f"{label}: {detail}" if detail else label)
 
-        ok("frame has a time axis", clock is not None,
-           "no key is a clock, so a horizon means nothing" if not clock else
-           f"clock is '{clock}' at {grain} grain")
-        if horizon:
-            ok("horizon needs a clock", clock is not None,
-               f"horizon {horizon} was asked for but the frame has no clock")
-        if season and grain:
+        if clocked:
+            ok("frame has a time axis", clock is not None,
+               "no key is a clock, so a horizon means nothing" if not clock else
+               f"clock is '{clock}' at {grain} grain")
+            if horizon:
+                ok("horizon needs a clock", clock is not None,
+                   f"horizon {horizon} was asked for but the frame has no clock")
+        if clocked and season and grain:
             natural = NATURAL_SEASON.get(grain)
             ok("season length suits the grain",
                natural is None or season in (natural, 1) or season % natural == 0,
@@ -306,7 +417,7 @@ class EngineAdapterService(BaseService):
         # the data-side checks the browser could never do
         n = self._series_count(frame, series_keys)
         per = len(frame) / n if n else 0
-        if season:
+        if clocked and season:
             ok("enough history to fit the season", per >= 2 * season,
                f"{per:.0f} points per series but a season of {season} needs "
                f"{2 * season}")
@@ -314,11 +425,12 @@ class EngineAdapterService(BaseService):
         bad = next((v for v in vals if v is not None and not _isnum(v)), None)
         ok("target is numeric", bad is None,
            f"'{target}' holds text (e.g. {bad!r})" if bad is not None else "")
-        holes = self._gaps(frame, clock, series_keys)
-        ok("the clock has no holes", not holes,
-           f"{len(holes)} series skip periods — a model that advances one "
-           f"period per row would be fitting a series that is not there"
-           if holes else "")
+        if clocked:
+            holes = self._gaps(frame, clock, series_keys)
+            ok("the clock has no holes", not holes,
+               f"{len(holes)} series skip periods — a model that advances one "
+               f"period per row would be fitting a series that is not there"
+               if holes else "")
         return warnings, checks
 
     @staticmethod
@@ -612,6 +724,75 @@ class EngineAdapterService(BaseService):
             "frame_meta": gmeta})
         checks["knobs the task cannot read are reported, not silently eaten"] = (
             set(ri["ignored_knobs"]) >= {"horizon", "season_length"})
+
+        # ---- classification: a labelled table, no clock ----
+        import random as _rc
+        cls, cmeta = [], {"keys": ["k_row"], "t_key": None, "grain": None,
+                          "classes": {"y": {"0": "N", "1": "Y"}}}
+        _rc.seed(5)
+        for i in range(120):
+            risk = i % 4 == 0
+            cls.append({"k_row": f"r{i}",
+                        "y": 1.0 if risk else 0.0,
+                        "f1": _rc.uniform(35, 68) if risk else _rc.uniform(70, 99),
+                        "f2": _rc.uniform(3, 14) if risk else _rc.uniform(0, 2)})
+        crc = {"engine": "local", "kind": "classify", "target": "y",
+               "features": ["f1", "f2"], "folds": 5, "positive_class": "Y"}
+        out, rr = self._adapt(cls, {"run_config": crc, "frame_meta": cmeta})
+
+        checks["kind routes to the classifier"] = rr["task"] == "classify"
+        checks["separable classes are learned"] = (
+            rr["accuracy"]["lift_over_baseline"] > 10)
+        checks["the majority-class baseline is reported"] = (
+            rr["accuracy"]["majority_baseline"] > 0
+            and rr["accuracy"]["majority_class"] == "N")
+        checks["per-class precision and recall are reported"] = (
+            set(rr["accuracy"]["per_class"]) == {"N", "Y"}
+            and "recall" in rr["accuracy"]["per_class"]["Y"])
+        checks["a confusion matrix is produced"] = (
+            sum(sum(v.values()) for v in rr["accuracy"]["confusion"].values()) == 120)
+        checks["class ids come back as names"] = (
+            out[0]["y"] in ("N", "Y") and out[0]["yhat"] in ("N", "Y"))
+        checks["classify declares its own knobs"] = (
+            "threshold" in rr["knobs"] and "horizon" not in rr["knobs"])
+
+        # a lower threshold must trade precision for recall, not improve both
+        lo, _ = self._adapt(cls, {"frame_meta": cmeta, "run_config": {
+            **crc, "threshold": 0.2, "class_weight": "balanced"}})
+        hi, _ = self._adapt(cls, {"frame_meta": cmeta, "run_config": {
+            **crc, "threshold": 0.8, "class_weight": "balanced"}})
+        n_lo = sum(1 for r in lo if r["yhat"] == "Y")
+        n_hi = sum(1 for r in hi if r["yhat"] == "Y")
+        checks["a lower threshold flags more rows"] = n_lo >= n_hi
+
+        # noise must not look like skill, averaged over seeds
+        lifts = []
+        for seed in range(6):
+            _rc.seed(200 + seed)
+            noise = [{"k_row": f"r{i}", "y": float(_rc.randint(0, 1)),
+                      "f1": _rc.random(), "f2": _rc.random()} for i in range(120)]
+            _, rn = self._adapt(noise, {"frame_meta": cmeta, "run_config": crc})
+            lifts.append(rn["accuracy"]["lift_over_baseline"] or 0.0)
+        checks["noise does not systematically beat the baseline"] = (
+            sum(lifts) / len(lifts) < 10)
+
+        # failures are loud
+        def cfails(frame, rc_over, needle):
+            try:
+                self._adapt(frame, {"frame_meta": cmeta,
+                                    "run_config": {**crc, **rc_over}})
+                return False
+            except ValueError as e:
+                return needle in str(e)
+        # positive_class is validated first, so drop it here — otherwise this
+        # asserts the wrong refusal and passes for the wrong reason.
+        checks["a single-class column is rejected"] = cfails(
+            [{**r, "y": 0.0} for r in cls], {"positive_class": ""},
+            "nothing to separate")
+        checks["too few rows is rejected"] = cfails(
+            cls[:3], {}, "too few")
+        checks["an unknown positive_class is rejected"] = cfails(
+            cls, {"positive_class": "Z"}, "is not one of the labels")
 
         # failures are loud
         def fails(params, needle):

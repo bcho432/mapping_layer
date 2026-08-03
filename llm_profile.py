@@ -67,6 +67,10 @@ Rules you cannot break:
 - kind `forecast` and `anomaly` require a time column; `recommend`, `cluster`,
   `classify`, `regress` and `rank` must not have one.
 - `recommend` needs exactly two key columns: who, and what they engaged with.
+- Every kind except forecast needs at least one key. When the file has no id
+  column — each row is already the thing being described, as in a table of
+  measurements — return the key name "__row_number__" instead of a column.
+  Never return an empty key list: a frame with no key has no rows.
 - Read the sentence, including negation. "not monthly" is not a vote for month.
 - Prefer `mean` over `sum` for an intensive quantity — a temperature, a rate, a
   ratio, a score, an index. Summing 31 daily temperatures is meaningless.
@@ -105,7 +109,9 @@ SCHEMA = {
         "series": {"type": "string",
                    "description": "column that names one series, or '' for a single series"},
         "keys": {"type": "array", "items": {"type": "string"},
-                 "description": "explicit key columns; used by clockless kinds"},
+                 "description": ("explicit key columns for clockless kinds; use "
+                                 "'__row_number__' when each row is already the "
+                                 "thing being described and no id column exists")},
         "dimensions": {"type": "array", "items": {"type": "string"}},
         "changes": {"type": "array", "items": {"type": "string"},
                     "description": "one short clause per change, empty if none"},
@@ -267,6 +273,17 @@ def _prompt(draft, schema, goal, catalog):
     )
 
 
+def _keep_draft_keys(draft, got, schema, catalog, names):
+    """Re-apply the reply with the draft's keys restored."""
+    patched = dict(got)
+    patched["keys"] = []
+    prof, probs = _apply(draft, patched, schema, catalog)
+    if probs:
+        return draft, probs
+    prof["keys"] = list(draft.get("keys") or [])
+    return prof, []
+
+
 def _seq(v):
     """A list, whatever arrived. A string is a scalar here, never characters."""
     return v if isinstance(v, list) else []
@@ -351,10 +368,20 @@ def _apply(draft, got, schema, catalog):
     if kind not in ("forecast", "anomaly") and event:
         problems.append(f"kind {kind!r} must not have a clock")
 
+    ROW = "__row_number__"
     keys = [str(k) for k in _seq(got.get("keys")) if str(k).strip()]
     for k in keys:
-        if k not in names:
+        if k != ROW and k not in names:
             problems.append(f"keys names {k!r}, which is not a column")
+    # An empty key list is never an intent — a frame with no key has no rows,
+    # and the compiler refuses it. Silently inheriting the draft's keys is the
+    # right recovery: the model was correcting the metrics, not deleting the
+    # grain. This is the same class as a hallucinated column, caught earlier.
+    if not keys and kind != "forecast":
+        draft_keys = draft.get("keys") if isinstance(draft, dict) else None
+        if isinstance(draft_keys, list) and draft_keys:
+            return _keep_draft_keys(draft, got, schema, catalog, names)
+        problems.append(f"kind {kind!r} needs at least one key; none were given")
     if kind == "recommend" and len(keys) != 2:
         problems.append(
             f"kind 'recommend' needs exactly two keys (who, what); got {len(keys)}")
@@ -368,7 +395,7 @@ def _apply(draft, got, schema, catalog):
 
     dims = [d for d in _seq(got.get("dimensions")) if d in names]
     for extra in ([series] if series else []) + keys:
-        if extra and extra not in dims:
+        if extra and extra != ROW and extra not in dims:
             dims.append(extra)
 
     profile = {"name": draft.get("name") or "profile",
@@ -381,7 +408,8 @@ def _apply(draft, got, schema, catalog):
     if event:
         profile["time"] = {"event": event, "grain": grain}
     if keys:
-        profile["keys"] = [{"name": f"k_{k}", "from": k} for k in keys]
+        profile["keys"] = [{"name": "k_row", "via": "row_number"} if k == ROW
+                           else {"name": f"k_{k}", "from": k} for k in keys]
     if series:
         profile["x-deep"] = {"series": series}
     return profile, []

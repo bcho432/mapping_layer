@@ -245,7 +245,8 @@
     </section>
 
     <section class="card">
-      <h2>the forecast <span id="engcount" class="pill idle">not run</span></h2>
+      <h2><span id="engtitle">the forecast</span>
+        <span id="engcount" class="pill idle">not run</span></h2>
       <div class="body">
         <p id="engverdict" class="verdict"></p>
         <div id="engstats" class="stats"></div>
@@ -265,8 +266,15 @@
         <p class="hint">Edit either document and re-run from that point. Editing the SPEC
           skips both upstream services, which is the quickest way to poke at the frame
           directly &mdash; try adding a second key, or deleting the target.</p>
-        <label>profile <textarea id="profileEd" rows="10" spellcheck="false"></textarea></label>
-        <label>binding <textarea id="bindingEd" rows="6" spellcheck="false"></textarea></label>
+        <label>profile &mdash; core <span class="hint" style="padding:0">what is in
+          the data, and how to fold it</span>
+          <textarea id="profileEd" rows="10" spellcheck="false"></textarea></label>
+        <label>profile &mdash; task <span class="hint" style="padding:0">what is being
+          asked: the kind, and what identifies one row</span>
+          <textarea id="taskEd" rows="6" spellcheck="false"></textarea></label>
+        <label>binding <span class="hint" style="padding:0">where those names live in
+          this file</span>
+          <textarea id="bindingEd" rows="6" spellcheck="false"></textarea></label>
         <button class="ghost" id="rerunProfile">Re-run from the profile</button>
         <label>SPEC <textarea id="specEd" rows="12" spellcheck="false"></textarea></label>
         <button class="ghost" id="rerunSpec">Re-run the mapping layer only</button>
@@ -375,6 +383,11 @@ function recTable(preds) {
 
 function paintEngine(r) {
   const em = r.engine_meta, preds = r.predictions || [];
+  $('engtitle').textContent =
+    !em ? 'the forecast'
+        : em.task === 'classify' ? 'the classification'
+        : em.task === 'recommend' ? 'the recommendations'
+        : 'the forecast';
   const clear = (cls, txt) => {
     $('engcount').className = 'pill ' + cls;
     $('engcount').textContent = txt;
@@ -416,6 +429,68 @@ function paintEngine(r) {
             : (Math.abs(x) >= 1e6 ? (x / 1e6).toFixed(2) + 'M'
             : Math.abs(x) >= 1e3 ? (x / 1e3).toFixed(1) + 'k' : String(x));
   const tiles = [];
+
+  // Classification has its own metric vocabulary — accuracy against a
+  // majority-class baseline, per-class recall, a confusion matrix. None of
+  // those fields exist in a forecast result, so without this branch the panel
+  // rendered empty tiles under a classification verdict and captioned it with
+  // clock checks that do not apply.
+  if (em.task === 'classify') {
+    const k = a.n_classes;
+    $('engcount').className = 'pill ' + ((a.lift_over_baseline || 0) > 0 ? 'ok' : 'warn');
+    $('engcount').textContent = `${a.rows_scored} rows \u00b7 ${k} classes`;
+
+    const tiles = [
+      ['accuracy', a.accuracy, false],
+      [`always "${a.majority_class}"`, a.majority_baseline, false],
+      ['lift over baseline',
+       a.lift_over_baseline === null ? '\u2014' : a.lift_over_baseline + '%',
+       (a.lift_over_baseline || 0) <= 0],
+      ['macro F1', a.macro_f1, a.macro_f1 < 0.5],
+    ];
+    if (a.roc_auc !== undefined && a.roc_auc !== null)
+      tiles.push(['ROC-AUC', a.roc_auc, a.roc_auc < 0.6]);
+    tiles.push(['folds', a.folds, false]);
+    $('engstats').innerHTML = tiles.map(([kk, val, bad]) =>
+      `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(kk)}</span></div>`
+    ).join('');
+
+    // Per-class first: accuracy hides a class the model cannot find, and that
+    // class is usually the one the question was asked about.
+    const cls = Object.keys(a.per_class);
+    let html = '<table class="fc"><thead><tr><th>class</th><th>precision</th>' +
+      '<th>recall</th><th>F1</th><th>rows</th></tr></thead><tbody>' +
+      cls.map(c => {
+        const m = a.per_class[c];
+        const weak = m.recall < 0.5;
+        return `<tr><td class="k">${esc(c)}${c === a.positive_class ? ' &middot; positive' : ''}</td>` +
+          `<td>${m.precision}</td><td class="${weak ? '' : 'fc'}">${m.recall}</td>` +
+          `<td>${m.f1}</td><td>${m.support}</td></tr>`;
+      }).join('') + '</tbody></table>';
+
+    if (a.confusion) {
+      html += '<table class="fc" style="margin-top:.9rem"><thead><tr>' +
+        '<th>actual \u2193 / predicted \u2192</th>' +
+        cls.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>' +
+        cls.map(actual => '<tr><td class="k">' + esc(actual) + '</td>' +
+          cls.map(pred => {
+            const n = (a.confusion[actual] || {})[pred] || 0;
+            return `<td class="${actual === pred && n ? 'fc' : ''}">${n}</td>`;
+          }).join('') + '</tr>').join('') + '</tbody></table>';
+    }
+    $('engfc').innerHTML = html;
+
+    const flagged = preds.filter(p => p.is_prediction === 'yes').length;
+    $('engnote').textContent =
+      `${a.folds}-fold stratified cross-validation \u00b7 model ${a.model} \u00b7 ` +
+      `threshold ${a.threshold} \u00b7 class weight ${a.class_weight} \u00b7 ` +
+      `features: ${(a.features || []).join(', ')}. Every row was predicted once by a ` +
+      `forest that never saw it. The baseline answers "${a.majority_class}" every ` +
+      `time and is right ${Math.round(a.majority_baseline * 100)}% of the time \u2014 ` +
+      `beating it is the whole test.` +
+      (flagged ? ` ${flagged} row(s) had no label and are genuine predictions.` : '');
+    return;
+  }
 
   // A recommendation is scored against POPULARITY, not against a naive
   // forecast, so it needs its own tiles. The forecasting set found nothing in
@@ -582,7 +657,13 @@ function render(r) {
   }
 
   if (!$('profileEd').value || !document.activeElement.matches('textarea')) {
-    $('profileEd').value = j(r.profile);
+    // The two panels are one document. `task` is lifted out for display and put
+    // back before the request goes out, so what you edit is what compiles.
+    const prof = Object.assign({}, r.profile);
+    const task = prof.task || {};
+    delete prof.task;
+    $('profileEd').value = j(prof);
+    $('taskEd').value = j({ task: task });
     $('bindingEd').value = j(r.binding);
     $('specEd').value = j(r.spec);
   }
@@ -687,8 +768,14 @@ function esc(s) {
 
 $('run').onclick = () => go();
 $('rerunProfile').onclick = () => {
-  const p = parse($('profileEd').value, 'profile');
+  const p = parse($('profileEd').value, 'profile \u2014 core');
+  const t = parse($('taskEd').value, 'profile \u2014 task');
   const b = parse($('bindingEd').value, 'binding');
+  if (p && t) {
+    // Accept either `{task: {...}}` or a bare `{kind, keys}` in the task panel,
+    // because both read naturally and refusing one is a trap rather than a rule.
+    p.task = (t && typeof t === 'object' && t.task) ? t.task : t;
+  }
   if (p && b) go({ profile: p, binding: b });
 };
 $('rerunSpec').onclick = () => {

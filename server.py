@@ -262,7 +262,11 @@ def run(payload):
     crc = next((st.get("detail", {}).get("run_config") for st in stages
                 if st["id"] == "compile" and isinstance(st.get("detail"), dict)),
                None) or {}
-    for k in ("target", "targets", "features"):
+    # `kind` rides along with the target/feature split: the adapter routes on it,
+    # and without it a classification frame falls through to the forecaster and
+    # is refused for having no clock — which is a true statement about the wrong
+    # question.
+    for k in ("kind", "target", "targets", "features"):
         if not rc.get(k) and crc.get(k):
             rc[k] = crc[k]
     predictions, engine_meta = None, None
