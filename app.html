@@ -52,6 +52,16 @@
   input,select,textarea{font-family:inherit;font-size:.88rem;color:var(--ink);
     background:var(--ground);border:1px solid var(--line);border-radius:3px;padding:.4rem .5rem;width:100%}
   textarea{font-family:var(--mono);font-size:.74rem;line-height:1.6;resize:vertical}
+  .verdict{margin:0 0 .7rem;padding:.55rem .8rem;border-radius:6px;
+    font-family:var(--mono);font-size:.82rem;border:1px solid}
+  .verdict.good{color:#7ee0b0;border-color:#2f6b52;background:#12241c}
+  .verdict.warn{color:#e3b877;border-color:#6b5730;background:#241d12}
+  .verdict.bad{color:#e88ea0;border-color:#6b3040;background:#241318}
+  .verdict.idle{color:var(--dim);border-color:var(--line);background:transparent}
+  .fc td.fc{color:#8fd7ff;font-weight:600}
+  .csvpick{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.25rem 0 .35rem}
+  .csvpick input[type=file]{font-size:.78rem;max-width:100%}
+  .csvpick .hint{margin:0}
   input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible{
     outline:2px solid var(--accent);outline-offset:1px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:.6rem}
@@ -142,6 +152,13 @@
             </select>
           </label>
         </div>
+        <label>Who reads the goal
+          <select id="reader">
+            <option value="llm">a model &mdash; reads the sentence</option>
+            <option value="regex">keywords only &mdash; deterministic</option>
+          </select>
+        </label>
+        <p class="hint" id="readerNote"></p>
         <label>Frame column names
           <select id="naming">
             <option value="v1">v1 &mdash; series_id / t / y / x_*</option>
@@ -149,9 +166,14 @@
           </select>
         </label>
         <button id="run">Run the pipeline</button>
-        <p class="hint">Custom data: pick <em>paste your own</em> and drop CSV into the
-          box that appears.</p>
+        <p class="hint">Custom data: pick <em>paste your own</em>, then choose a file
+          or paste into the box. Files are read in the browser &mdash; nothing is
+          uploaded, and the server still receives plain CSV text.</p>
         <label id="csvwrap" style="display:none">CSV
+          <span class="csvpick">
+            <input type="file" id="csvfile" accept=".csv,text/csv">
+            <span id="csvnote" class="hint"></span>
+          </span>
           <textarea id="csv" rows="7" spellcheck="false"></textarea>
         </label>
       </div>
@@ -163,30 +185,44 @@
         <div class="row">
           <label>Engine
             <select id="engine">
-              <option value="nixtla">nixtla</option>
-              <option value="autogluon">autogluon</option>
+              <option value="local">local &mdash; fits, here</option>
+              <option value="nixtla">nixtla &mdash; prepare only</option>
+              <option value="autogluon">autogluon &mdash; prepare only</option>
             </select>
           </label>
-          <label>Model
+          <label data-knob="model">Model
             <select id="model"><option>AutoETS</option><option>AutoARIMA</option><option>auto</option></select>
           </label>
         </div>
-        <div class="row">
+        <div class="row" data-knob="horizon season_length">
           <label>Horizon <input id="horizon" type="number" value="4" min="1"></label>
           <label>Season length <input id="season" type="number" value="4" min="1"></label>
         </div>
-        <div class="row">
+        <div class="row" data-knob="quantiles backtest">
           <label>Quantiles <input id="quantiles" value="0.1, 0.5, 0.9"></label>
           <label>Backtest windows <input id="windows" type="number" value="3" min="0"></label>
         </div>
-        <label>Target column
-          <select id="target"><option value="">(run the pipeline first)</option></select>
-        </label>
-        <div id="covariates" class="hint">Everything else in the frame becomes a covariate.</div>
+        <div class="row" data-knob="top_k holdout">
+          <label>Top-k <input id="topk" type="number" value="5" min="1"></label>
+          <label>Holdout <input id="holdout" type="number" value="0.3" min="0.1"
+                 max="0.6" step="0.05"></label>
+        </div>
+        <div class="row" data-knob="folds">
+          <label>Backtest folds <input id="folds" type="number" value="5" min="1" max="20"></label>
+          <label>&nbsp;</label>
+        </div>
+        <div class="row">
+          <label>Target <input id="rcTarget" placeholder="run to fill"></label>
+          <label>Features <input id="rcFeatures" placeholder="comma separated"></label>
+        </div>
+        <p class="hint" id="knobNote"></p>
+        <p class="hint" id="engineNote"></p>
+        <p class="hint" id="rcNote"></p>
         <p class="hint">Nothing here is sent to a service. It is echoed back untouched so
           you can confirm the frame is a pure function of the SPEC &mdash; change any of
-          these, <strong>including the target</strong>, and re-run: every cell must be
-          identical. The SPEC aggregates; picking which column to predict happens here.</p>
+          these and re-run: every cell must be identical. <strong>Target and features
+          now live here too</strong>, so changing what you predict cannot move a
+          single cell of the frame.</p>
       </div>
     </section>
 
@@ -209,6 +245,17 @@
     </section>
 
     <section class="card">
+      <h2><span id="engtitle">the forecast</span>
+        <span id="engcount" class="pill idle">not run</span></h2>
+      <div class="body">
+        <p id="engverdict" class="verdict"></p>
+        <div id="engstats" class="stats"></div>
+        <div id="engfc" class="scroll"></div>
+        <p id="engnote" class="note"></p>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>stages</h2>
       <div id="flow" class="flow" style="padding:.7rem"></div>
     </section>
@@ -219,8 +266,15 @@
         <p class="hint">Edit either document and re-run from that point. Editing the SPEC
           skips both upstream services, which is the quickest way to poke at the frame
           directly &mdash; try adding a second key, or deleting the target.</p>
-        <label>profile <textarea id="profileEd" rows="10" spellcheck="false"></textarea></label>
-        <label>binding <textarea id="bindingEd" rows="6" spellcheck="false"></textarea></label>
+        <label>profile &mdash; core <span class="hint" style="padding:0">what is in
+          the data, and how to fold it</span>
+          <textarea id="profileEd" rows="10" spellcheck="false"></textarea></label>
+        <label>profile &mdash; task <span class="hint" style="padding:0">what is being
+          asked: the kind, and what identifies one row</span>
+          <textarea id="taskEd" rows="6" spellcheck="false"></textarea></label>
+        <label>binding <span class="hint" style="padding:0">where those names live in
+          this file</span>
+          <textarea id="bindingEd" rows="6" spellcheck="false"></textarea></label>
         <button class="ghost" id="rerunProfile">Re-run from the profile</button>
         <label>SPEC <textarea id="specEd" rows="12" spellcheck="false"></textarea></label>
         <button class="ghost" id="rerunSpec">Re-run the mapping layer only</button>
@@ -244,6 +298,31 @@ async function boot() {
   const sel = $('dataset');
   DATASETS.forEach(d => sel.add(new Option(d.id, d.id)));
   sel.add(new Option('paste your own', '__custom'));
+
+  // A file picker is a convenience over the same textarea: the file is read
+  // locally with FileReader and its text dropped into #csv, so /api/run keeps
+  // receiving exactly what a paste would have sent.
+  $('engine').addEventListener('change', engineHint);
+  engineHint();
+  $('reader').addEventListener('change', () => { readerHint(); run(); });
+  readerHint();
+
+  $('csvfile').addEventListener('change', ev => {
+    const f = ev.target.files && ev.target.files[0];
+    const note = $('csvnote');
+    if (!f) { note.textContent = ''; return; }
+    note.textContent = 'reading ' + f.name + '\u2026';
+    const fr = new FileReader();
+    fr.onload = () => {
+      $('csv').value = fr.result;
+      const lines = fr.result.split(/\r?\n/).filter(l => l.trim()).length;
+      const kb = (f.size / 1024).toFixed(1);
+      note.textContent = f.name + ' \u00b7 ' + Math.max(0, lines - 1) +
+                         ' rows \u00b7 ' + kb + ' kB';
+    };
+    fr.onerror = () => { note.textContent = 'could not read ' + f.name; };
+    fr.readAsText(f);
+  });
   sel.onchange = () => {
     $('csvwrap').style.display = sel.value === '__custom' ? 'grid' : 'none';
   };
@@ -257,15 +336,230 @@ async function boot() {
   }).catch(() => {});
 }
 
-function aggColumns(spec) {
-  return [].concat(
-    (spec && spec.aggregates || []).map(a => a.name),
-    (spec && spec.derives || []).map(d => d.name));
+function readerHint() {
+  $('readerNote').textContent = $('reader').value === 'llm'
+    ? 'A model corrects the keyword draft, then the same deterministic validation '
+      + 'runs on the result \u2014 an unknown column or function is rejected and the '
+      + 'draft is kept.'
+    : 'Keyword matching only. Reproducible and free, but it cannot read negation '
+      + 'or a synonym that is not in the table.';
+}
+
+function engineHint() {
+  const e = $('engine').value;
+  $('engineNote').textContent = e === 'local'
+    ? 'local fits stdlib exponential smoothing here and returns real predictions '
+      + 'with a rolling-origin accuracy estimate \u2014 no external service.'
+    : e + ' is prepared, not run: you get its dialect payload back to POST wherever '
+      + e + ' lives. Pick local to see numbers.';
+}
+
+function paintKnobs(em) {
+  // The engine declares which knobs it reads; anything else is hidden rather
+  // than left on screen looking like it did something. Before the first run
+  // nothing is known, so everything shows.
+  const known = em && em.knobs ? new Set(em.knobs) : null;
+  document.querySelectorAll('[data-knob]').forEach(el => {
+    const wanted = el.dataset.knob.split(' ');
+    el.style.display = !known || wanted.some(k => known.has(k)) ? '' : 'none';
+  });
+  const ig = (em && em.ignored_knobs) || [];
+  $('knobNote').textContent = !em ? ''
+    : ig.length
+      ? `${em.task} ignores ${ig.join(', ')} — those belong to a different question.`
+      : `Showing the knobs a ${em.task} actually reads.`;
+}
+
+function recTable(preds) {
+  if (!preds || !preds.length) return '<p class="note">No recommendations.</p>';
+  const cols = Object.keys(preds[0]).filter(c => c !== 'is_recommendation');
+  return '<table class="fc"><thead><tr>' + cols.map(c => `<th>${esc(c)}</th>`).join('') +
+    '</tr></thead><tbody>' + preds.slice(0, 40).map(row => '<tr>' + cols.map(c => {
+      const v = row[c];
+      return `<td class="${c === 'score' || c === 'rank' ? 'fc' : ''}">${
+        esc(typeof v === 'number' ? Math.round(v * 1000) / 1000 : v)}</td>`;
+    }).join('') + '</tr>').join('') + '</tbody></table>';
+}
+
+function paintEngine(r) {
+  const em = r.engine_meta, preds = r.predictions || [];
+  $('engtitle').textContent =
+    !em ? 'the forecast'
+        : em.task === 'classify' ? 'the classification'
+        : em.task === 'recommend' ? 'the recommendations'
+        : 'the forecast';
+  const clear = (cls, txt) => {
+    $('engcount').className = 'pill ' + cls;
+    $('engcount').textContent = txt;
+    $('engverdict').className = 'verdict idle';
+    $('engverdict').textContent = '';
+    $('engstats').innerHTML = '';
+    $('engfc').innerHTML = '';
+  };
+  if (!em) { clear('idle', 'not run');
+    $('engnote').textContent = 'No engine ran. Set a run config and re-run.'; return; }
+
+  const fc = preds.filter(p => p.is_forecast === 'yes');
+
+  // prepared-only: the payload is the deliverable, not a number
+  if (em.mode === 'prepare') {
+    clear('warn', em.engine + ' — prepared');
+    $('engfc').innerHTML = '<table><thead><tr>' +
+      Object.keys(preds[0] || {}).map(c => `<th>${esc(c)}</th>`).join('') +
+      '</tr></thead><tbody>' + preds.slice(0, 12).map(row =>
+        '<tr>' + Object.values(row).map(v =>
+          v === null ? '<td class="null">null</td>' : `<td>${esc(v)}</td>`
+        ).join('') + '</tr>').join('') + '</tbody></table>';
+    $('engnote').textContent = em.note || '';
+    return;
+  }
+
+  const a = em.accuracy || {};
+  const v = String(em.verdict || '');
+  $('engcount').className = 'pill ' + (fc.length ? 'ok' : 'warn');
+  $('engcount').textContent = fc.length
+    ? `${fc.length} period${fc.length === 1 ? '' : 's'} ahead` : 'no forecast';
+  $('engverdict').className = 'verdict ' +
+    (v.startsWith('trusted') || v.startsWith('exact') ? 'good'
+     : v.startsWith('weak') || v.startsWith('mixed') ? 'warn'
+     : v.startsWith('unpredictable') ? 'bad' : 'idle');
+  $('engverdict').textContent = v;
+
+  const n = x => x === undefined || x === null ? null
+            : (Math.abs(x) >= 1e6 ? (x / 1e6).toFixed(2) + 'M'
+            : Math.abs(x) >= 1e3 ? (x / 1e3).toFixed(1) + 'k' : String(x));
+  const tiles = [];
+
+  // Classification has its own metric vocabulary — accuracy against a
+  // majority-class baseline, per-class recall, a confusion matrix. None of
+  // those fields exist in a forecast result, so without this branch the panel
+  // rendered empty tiles under a classification verdict and captioned it with
+  // clock checks that do not apply.
+  if (em.task === 'classify') {
+    const k = a.n_classes;
+    $('engcount').className = 'pill ' + ((a.lift_over_baseline || 0) > 0 ? 'ok' : 'warn');
+    $('engcount').textContent = `${a.rows_scored} rows \u00b7 ${k} classes`;
+
+    const tiles = [
+      ['accuracy', a.accuracy, false],
+      [`always "${a.majority_class}"`, a.majority_baseline, false],
+      ['lift over baseline',
+       a.lift_over_baseline === null ? '\u2014' : a.lift_over_baseline + '%',
+       (a.lift_over_baseline || 0) <= 0],
+      ['macro F1', a.macro_f1, a.macro_f1 < 0.5],
+    ];
+    if (a.roc_auc !== undefined && a.roc_auc !== null)
+      tiles.push(['ROC-AUC', a.roc_auc, a.roc_auc < 0.6]);
+    tiles.push(['folds', a.folds, false]);
+    $('engstats').innerHTML = tiles.map(([kk, val, bad]) =>
+      `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(kk)}</span></div>`
+    ).join('');
+
+    // Per-class first: accuracy hides a class the model cannot find, and that
+    // class is usually the one the question was asked about.
+    const cls = Object.keys(a.per_class);
+    let html = '<table class="fc"><thead><tr><th>class</th><th>precision</th>' +
+      '<th>recall</th><th>F1</th><th>rows</th></tr></thead><tbody>' +
+      cls.map(c => {
+        const m = a.per_class[c];
+        const weak = m.recall < 0.5;
+        return `<tr><td class="k">${esc(c)}${c === a.positive_class ? ' &middot; positive' : ''}</td>` +
+          `<td>${m.precision}</td><td class="${weak ? '' : 'fc'}">${m.recall}</td>` +
+          `<td>${m.f1}</td><td>${m.support}</td></tr>`;
+      }).join('') + '</tbody></table>';
+
+    if (a.confusion) {
+      html += '<table class="fc" style="margin-top:.9rem"><thead><tr>' +
+        '<th>actual \u2193 / predicted \u2192</th>' +
+        cls.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>' +
+        cls.map(actual => '<tr><td class="k">' + esc(actual) + '</td>' +
+          cls.map(pred => {
+            const n = (a.confusion[actual] || {})[pred] || 0;
+            return `<td class="${actual === pred && n ? 'fc' : ''}">${n}</td>`;
+          }).join('') + '</tr>').join('') + '</tbody></table>';
+    }
+    $('engfc').innerHTML = html;
+
+    const flagged = preds.filter(p => p.is_prediction === 'yes').length;
+    $('engnote').textContent =
+      `${a.folds}-fold stratified cross-validation \u00b7 model ${a.model} \u00b7 ` +
+      `threshold ${a.threshold} \u00b7 class weight ${a.class_weight} \u00b7 ` +
+      `features: ${(a.features || []).join(', ')}. Every row was predicted once by a ` +
+      `forest that never saw it. The baseline answers "${a.majority_class}" every ` +
+      `time and is right ${Math.round(a.majority_baseline * 100)}% of the time \u2014 ` +
+      `beating it is the whole test.` +
+      (flagged ? ` ${flagged} row(s) had no label and are genuine predictions.` : '');
+    return;
+  }
+
+  // A recommendation is scored against POPULARITY, not against a naive
+  // forecast, so it needs its own tiles. The forecasting set found nothing in
+  // this accuracy object and rendered an empty row.
+  if (em.task === 'recommend') {
+    const k = a.k;
+    tiles.push([`precision@${k}`, a.precision_at_k, false]);
+    tiles.push([`popularity@${k}`, a.popular_precision_at_k, false]);
+    tiles.push(['lift over popular',
+                (a.lift_over_popularity === null ? '—' : a.lift_over_popularity + '%'),
+                (a.lift_over_popularity || 0) <= 0]);
+    tiles.push([`recall@${k}`, a.recall_at_k, false]);
+    tiles.push([`MAP@${k}`, a.map_at_k, false]);
+    tiles.push(['catalog covered', a.catalog_coverage, false]);
+    tiles.push(['users scored', a.users_scored, false]);
+    if (a.folds > 1) tiles.push(['folds', a.folds, false]);
+    $('engstats').innerHTML = tiles.map(([kk, val, bad]) =>
+      `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(kk)}</span></div>`
+    ).join('');
+    $('engfc').innerHTML = recTable(preds);
+    const spread = (a.lift_min !== undefined)
+      ? ` Across ${a.folds} splits the lift ranged ${a.lift_min}% to ${a.lift_max}%.` : '';
+    $('engnote').textContent =
+      `${a.method} · ${Math.round(a.holdout * 100)}% of each user\u2019s history held back, ` +
+      `${a.users} users, ${a.interactions} interactions. The baseline recommends whatever ` +
+      `is most popular to everybody — beating it is the whole test.` + spread;
+    $('engcount').className = 'pill ' + ((a.lift_over_popularity || 0) > 0 ? 'ok' : 'warn');
+    $('engcount').textContent = `top ${k} per user`;
+    return;
+  }
+
+  if (a.mape !== undefined) tiles.push(['MAPE', a.mape + '%', false]);
+  else if (a.mae !== undefined) tiles.push(['MAE', n(a.mae), false]);
+  if (a.naive_mape !== undefined) tiles.push(['naive', a.naive_mape + '%', false]);
+  else if (a.naive_mae !== undefined) tiles.push(['naive MAE', n(a.naive_mae), false]);
+  if (a.mase !== undefined) tiles.push(['MASE', a.mase, a.mase >= 1]);
+  if (a.skill_vs_naive !== undefined)
+    tiles.push(['skill vs naive', a.skill_vs_naive + '%', a.skill_vs_naive <= 0]);
+  tiles.push(['horizon', em.horizon, false]);
+  tiles.push(['series', em.series_count, false]);
+  $('engstats').innerHTML = tiles.map(([k, val, bad]) =>
+    `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(k)}</span></div>`
+  ).join('');
+
+  if (fc.length) {
+    const cols = Object.keys(fc[0]).filter(c => c !== 'is_forecast');
+    $('engfc').innerHTML = '<table class="fc"><thead><tr>' +
+      cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>' +
+      fc.map(row => '<tr>' + cols.map(c => {
+        const val = row[c];
+        if (val === null || val === undefined) return '<td class="null">null</td>';
+        return `<td class="${c === 'yhat' ? 'fc' : ''}">${esc(
+          typeof val === 'number' ? Math.round(val * 100) / 100 : val)}</td>`;
+      }).join('') + '</tr>').join('') + '</tbody></table>';
+  } else {
+    $('engfc').innerHTML = '<p class="note">No future rows — every series was too ' +
+      'short to fit.</p>';
+  }
+
+  const bad = (em.checks || []).filter(c => !c.ok);
+  $('engnote').textContent = bad.length
+    ? 'Compatibility: ' + bad.map(c => c.check + ' — ' + c.detail).join('; ')
+    : `${em.engine} · ${(a.per_series || [{}])[0].model || '—'} · scored over ` +
+      `${(a.per_series || [{}])[0].points_scored || 0} points across ` +
+      `${(a.per_series || [{}])[0].folds || 0} rolling origins. Accuracy is measured ` +
+      `on data held back from fitting, and compared against carrying the last value forward.`;
 }
 
 function runConfig() {
-  const cols = aggColumns(LAST && LAST.spec);
-  const target = $('target').value;
   return {
     engine: $('engine').value,
     model: $('model').value,
@@ -273,29 +567,12 @@ function runConfig() {
     season_length: +$('season').value,
     quantiles: $('quantiles').value.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n)),
     backtest: { windows: +$('windows').value, step: 1, refit: false },
-    // the SPEC has no roles; this is where a column becomes the thing predicted
-    target: target || null,
-    covariates: cols.filter(c => c !== target)
+    target: $('rcTarget').value.trim() || null,
+    features: $('rcFeatures').value.split(',').map(s => s.trim()).filter(Boolean),
+    top_k: +$('topk').value || undefined,
+    holdout: +$('holdout').value || undefined,
+    folds: +$('folds').value || undefined
   };
-}
-
-// Repopulate the target picker from the emitted SPEC, defaulting to whatever the
-// compiler says the profile intended — a suggestion the run config may override.
-function drawTarget(r) {
-  const sel = $('target'), cols = aggColumns(r.spec);
-  const hint = ((r.stages.find(s => s.id === 'compile') || {}).detail || {}).run_config_hint;
-  const wanted = sel.value && cols.includes(sel.value) ? sel.value
-    : (hint && hint.target && hint.target[0]) || cols[0] || '';
-  sel.innerHTML = '';
-  sel.add(new Option('(none — unsupervised)', ''));
-  cols.forEach(c => sel.add(new Option(c, c)));
-  sel.value = wanted;
-  const rest = cols.filter(c => c !== sel.value);
-  $('covariates').innerHTML = rest.length
-    ? `Covariates: ${rest.map(esc).join(', ')}` +
-      (hint && hint.known_ahead && hint.known_ahead.length
-        ? ` &middot; known ahead per the profile: ${hint.known_ahead.map(esc).join(', ')}` : '')
-    : 'No covariates — the frame is target-only.';
 }
 
 function payload(extra) {
@@ -307,6 +584,7 @@ function payload(extra) {
     csv: id === '__custom' ? $('csv').value : (ds ? ds.csv : ''),
     grain: $('grain').value,
     naming: $('naming').value,
+    llm: $('reader').value === 'llm',
     run_config: runConfig()
   }, extra || {});
 }
@@ -336,11 +614,31 @@ function render(r) {
     const d = document.createElement('details');
     d.className = 'stage' + (s.ok ? '' : ' bad');
     d.open = !s.ok;
-    const shown = s.ok ? j(s.output) : (s.error + '\n\n' + (s.trace || []).join('\n'));
+    // The LLM stage's interesting output is WHY it changed things, not the
+    // profile it returned — that shows up in the profile panel anyway.
+    let shown;
+    if (!s.ok) {
+      shown = s.error + '\n\n' + (s.trace || []).join('\n');
+    } else if (s.id === 'llm') {
+      const d = s.detail || {};
+      shown = (d.off ? 'turned off \u2014 keywords are reading the goal.\n'
+                        + 'Switch "Who reads the goal" to compare.'
+                     : d.used ? 'the model read the goal and changed:\n'
+                        + (d.changes || []).map(c => '  - ' + c).join('\n')
+                        + (d.changes && d.changes.length ? '' : '  (nothing)')
+                        + `\n\nmodel ${d.model}`
+                        + (d.usage ? `  ·  ${d.usage.input} in / ${d.usage.output} out tokens` : '')
+                     : 'not used — kept the keyword scaffold\nreason: ' + (d.reason || '?'))
+              + (d.rejected ? '\n\nrejected because:\n'
+                              + d.rejected.map(x => '  - ' + x).join('\n') : '');
+    } else {
+      shown = j(s.output);
+    }
     d.innerHTML = `<summary>
         <span class="n">S${i + 1}</span>
         <span class="nm">${s.title}</span>
-        <span class="pill ${s.ok ? 'ok' : 'bad'}">${s.ok ? 'ok' : 'failed'}</span>
+        <span class="pill ${s.ok ? (s.id === 'llm' && !(s.detail || {}).used ? 'idle' : 'ok') : 'bad'}">${
+          s.ok ? (s.id === 'llm' ? ((s.detail || {}).used ? 'read the goal' : 'skipped') : 'ok') : 'failed'}</span>
         <span class="ms">${s.ms} ms</span>
       </summary>` + (s.ok ? `<pre>${esc(shown)}</pre>` : `<div class="err">${esc(shown)}</div>`);
     flow.appendChild(d);
@@ -359,14 +657,32 @@ function render(r) {
   }
 
   if (!$('profileEd').value || !document.activeElement.matches('textarea')) {
-    $('profileEd').value = j(r.profile);
+    // The two panels are one document. `task` is lifted out for display and put
+    // back before the request goes out, so what you edit is what compiles.
+    const prof = Object.assign({}, r.profile);
+    const task = prof.task || {};
+    delete prof.task;
+    $('profileEd').value = j(prof);
+    $('taskEd').value = j({ task: task });
     $('bindingEd').value = j(r.binding);
     $('specEd').value = j(r.spec);
+  }
+  const crc = r.compiled_run_config;
+  if (crc) {
+    const editing = document.activeElement &&
+                    ['rcTarget', 'rcFeatures'].includes(document.activeElement.id);
+    if (!editing) {
+      $('rcTarget').value = crc.target || (crc.targets || []).join(', ');
+      $('rcFeatures').value = (crc.features || []).join(', ');
+    }
+    $('rcNote').textContent =
+      'Scaffolded by the compiler from the profile\u2019s roles (kind: ' +
+      (crc.kind || '?') + '). The SPEC carries no role \u2014 edit these and ' +
+      're-run: the frame must not move.';
   }
 
   drawFrame(r);
   drawStats(r);
-  drawTarget(r);
   drawCompat(r);
 }
 
@@ -386,6 +702,8 @@ function drawFrame(r) {
     return `<td class="${keys.has(c) ? 'k' : ''}">${esc(v)}</td>`;
   }).join('') + '</tr>').join('');
   $('frame').innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+  paintEngine(r);
+  paintKnobs(r.engine_meta);
   $('framenote').textContent =
     `Column names come from the SPEC (naming = ${$('naming').value}). ` +
     `Keys: ${(r.frame_meta.keys || []).join(', ')}.`;
@@ -436,19 +754,9 @@ function drawCompat(r) {
   } else {
     add('ok', 'ok', `${cfg.engine} accepts ${entityKeys.length} entity key${entityKeys.length === 1 ? '' : 's'}.`);
   }
-  if (!cfg.target) {
-    add('note', 'idle', `No target selected — unsupervised. The SPEC does not care; it aggregated either way.`);
-  } else if (!aggColumns(spec).includes(cfg.target)) {
-    add('fail', 'bad', `target <code>${esc(cfg.target)}</code> is not a column in this frame.`);
-  } else {
-    add('ok', 'ok', `predicting <code>${esc(cfg.target)}</code>, ${cfg.covariates.length} covariate(s) alongside.`);
-  }
-  const anchored = (spec.aggregates || []).filter(a => a.anchor === 'arrival');
-  if (anchored.length) {
-    if (cfg.target && anchored.some(a => a.name === cfg.target)) {
-      add('warn', 'warn', `target <code>${esc(cfg.target)}</code> is anchored to arrival, so its values were re-filed forward. Labels normally anchor to the event period — check that is what you meant.`);
-    }
-    add('n/a', 'idle', `${anchored.length} arrival-anchored column(s): coverage to +${cfg.horizon} is a data question the adapter must check against real rows, not a document check.`);
+  const ka = (spec.aggregates || []).filter(a => a.availability === 'known_ahead');
+  if (ka.length) {
+    add('n/a', 'idle', `${ka.length} known_ahead covariate(s): coverage to +${cfg.horizon} is a data question the adapter must check against real rows, not a document check.`);
   }
   add('note', 'idle', `Frame is unchanged by any of the above — the run config never reaches a service.`);
   $('compat').innerHTML = out.join('');
@@ -460,20 +768,22 @@ function esc(s) {
 
 $('run').onclick = () => go();
 $('rerunProfile').onclick = () => {
-  const p = parse($('profileEd').value, 'profile');
+  const p = parse($('profileEd').value, 'profile \u2014 core');
+  const t = parse($('taskEd').value, 'profile \u2014 task');
   const b = parse($('bindingEd').value, 'binding');
+  if (p && t) {
+    // Accept either `{task: {...}}` or a bare `{kind, keys}` in the task panel,
+    // because both read naturally and refusing one is a trap rather than a rule.
+    p.task = (t && typeof t === 'object' && t.task) ? t.task : t;
+  }
   if (p && b) go({ profile: p, binding: b });
 };
 $('rerunSpec').onclick = () => {
   const s = parse($('specEd').value, 'SPEC');
   if (s) go({ spec: s, profile: LAST && LAST.profile, binding: LAST && LAST.binding });
 };
-['engine', 'model', 'horizon', 'season', 'quantiles', 'windows', 'target'].forEach(
-  id => $(id).addEventListener('input', () => {
-    if (!LAST || !LAST.ok) return;
-    if (id === 'target') drawTarget(LAST);
-    drawCompat(LAST);
-  }));
+['engine', 'model', 'horizon', 'season', 'quantiles', 'windows'].forEach(
+  id => $(id).addEventListener('input', () => { if (LAST && LAST.ok) drawCompat(LAST); }));
 
 boot();
 </script>

@@ -42,6 +42,7 @@ month_of_year,key,scalar,Calendar month number of the bucket
 quarter_of_year,key,scalar,Calendar quarter number of the bucket
 day_of_week,key,scalar,ISO weekday of the bucket (Monday is 1)
 year,key,scalar,Calendar year of the bucket
+row_number,key,position,Each input row becomes its own frame row - for data that is already one row per thing
 """
 
 # The grains a bin: derive understands, in the order the old GRAINS tuple had.
@@ -87,6 +88,11 @@ def _scalar(name, d):
 _IMPLEMENTED = (
     {"bin:" + g for g in GRAINS}
     | {"week_of_year", "month_of_year", "quarter_of_year", "day_of_week", "year"}
+    # `row_number` needs no function here: its value is the row's position, which
+    # only the executor knows. It is listed as implemented because the mapping
+    # layer handles the "position" scope directly in _key_tuple, the same way a
+    # bin: spine is handled outside apply_bucket.
+    | {"row_number"}
 )
 
 

@@ -38,13 +38,20 @@ max,core,reduction,measure,Largest value of a measure
 count,core,reduction,,Count the rows in the bucket
 first,core,reduction,measure,First value in the bucket by input order
 last,core,reduction,measure,Last value in the bucket by input order
+label,class,reduction,measure,The bucket's most common category as an integer class id; the id-to-name mapping is reported in frame metadata
 hhi,supply-chain,group,measure|entity,Herfindahl-Hirschman index: sum of squared percent shares of a measure across an entity
 top_share,supply-chain,group,measure|entity,Largest single entity percent share of the measure in the bucket
 """
 
 # Which catalogued functions actually have working code here. Reductions are run
 # by the mapping layer's `_agg`; groups are run by `apply_group` below.
-IMPLEMENTED_REDUCTIONS = {"sum", "mean", "min", "max", "count", "first", "last"}
+IMPLEMENTED_REDUCTIONS = {"sum", "mean", "min", "max", "count", "first", "last",
+                          "label"}
+
+# `label` folds categories rather than numbers, handing back an integer class id
+# so the frame stays a numeric matrix. See the mapping layer's copy for the
+# implementation; this service only needs to know the function exists.
+CATEGORICAL_REDUCTIONS = {"label"}
 
 
 # --------------------------------------------------------------- group functions

@@ -28,14 +28,6 @@ The emitted SPEC is positioned: keys (what a row is), aggregates (the numbers),
 derives (calendar columns), filters (which rows count) and validity (when a row
 became knowable). Time is not a special slot -- it is a key with a bin: derive.
 
-WHAT THE SPEC DELIBERATELY OMITS. The profile says which metric is the target
-and which covariates are known ahead. Neither reaches the SPEC: picking a target
-is a per-run choice, and choosing differently must not move a frame cell. They
-come back as `metadata.run_config_hint`, for the run config to accept or
-override. The one part of that pair which does move data survives as
-`aggregates[].anchor` -- a covariate knowable only in arrears is anchored to its
-arrival bucket, while a label always describes its own period.
-
 Input   request.parameters.profile   the OSI profile (parsed object)
         request.parameters.binding   the physical binding (parsed object)
         request.parameters.naming    'v1' (default) keeps the frame's legacy
@@ -62,15 +54,19 @@ from spl.core.base_service.base_service_class import BaseService
 from spl.core.service_types import ParameterEnum
 
 try:  # sibling modules: package-relative when deployed, flat when run locally
-    from . import derive_library, function_library
+    from . import derive_library, function_library, task_library
 except ImportError:  # pragma: no cover
     import derive_library
     import function_library
+    import task_library
 
 GRAINS = derive_library.GRAINS
-ROLES = ("target", "feature")
-AVAIL = ("known_ahead", "past_only")
+ROLES = ("target", "feature")            # legacy authoring vocabulary only
+AVAIL = task_library.AVAIL
 NAMINGS = ("v1", "logical")
+
+# Kinds that were spelled differently before the catalog existed.
+KIND_ALIASES = {"anomaly": "detect_anomaly"}
 
 # Which SPEC field a catalogued `needs` token lowers into. A catalog row that
 # names a need with no entry here is a gap the compiler reports rather than
@@ -85,26 +81,173 @@ NEED_ARG = {
 }
 NEED_MSG = {"measure": "a measure", "entity": "a 'by' entity"}
 
-# The contract, as data. R require / P permit / F forbid, and a (min, max) count
-# of entity keys -- the keys that are not a time bin. This is the only place the
-# kinds exist: the mapping layer never learns what a `kind` is.
-CONTRACT = {
-    "forecast":  {"keys": (0, 1), "time_from": "R", "time_bin": "R",
-                  "targets": "R", "features": "P", "validity": "P"},
-    "anomaly":   {"keys": (0, 1), "time_from": "R", "time_bin": "R",
-                  "targets": "R", "features": "P", "validity": "P"},
-    "classify":  {"keys": (1, 2), "time_from": "P", "time_bin": "P",
-                  "targets": "R", "features": "R", "validity": "F"},
-    "cluster":   {"keys": (1, 2), "time_from": "P", "time_bin": "P",
-                  "targets": "F", "features": "R", "validity": "F"},
-    "regress":   {"keys": (1, 2), "time_from": "F", "time_bin": "F",
-                  "targets": "R", "features": "R", "validity": "F"},
-    "recommend": {"keys": (2, 2), "time_from": "F", "time_bin": "F",
-                  "targets": "R", "features": "P", "validity": "F"},
-    "rank":      {"keys": (2, 2), "time_from": "F", "time_bin": "F",
-                  "targets": "R", "features": "R", "validity": "F"},
-}
-KINDS = tuple(CONTRACT)
+# The contract now lives in `task_library` -- one table, shared with the
+# profile-generator, so the service that WRITES a task and the service that
+# LOWERS it cannot drift apart. It replaced a hand-kept CONTRACT dict here plus
+# a separate KNOWN_KINDS/CLOCKED_KINDS pair over there, which is two tables
+# describing the same seven questions. Adding an engine is a row.
+#
+# The mapping layer still never learns what a `kind` is.
+KINDS = task_library.kinds()
+
+
+def task_field(profile, field, default=None):
+    """Read a question-shaped field from `profile.task`, or the top level.
+
+    The profile splits in two: `task` is what is being asked (the kind, and
+    what identifies a row), and everything else describes the data. Both
+    shapes are accepted — a flat profile is the original vocabulary and still
+    compiles unchanged — so the split can be adopted, or backed out, without a
+    migration. Deliberately NOT gated on `version`: gating catches a typo like
+    "tsak" that would otherwise read as a flat profile with no kind, but it
+    also commits to a schema before anyone has lived with it.
+    """
+    t = profile.get("task")
+    if isinstance(t, dict) and field in t:
+        return t[field]
+    return profile.get(field, default)
+
+
+def _clock_of(raw, where):
+    """Validate a {event, grain, arrival} clock and return it, or None."""
+    if raw in (None, "", {}):
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{where} must be an object with event and grain")
+    event = str(raw.get("event") or "").strip()
+    grain = str(raw.get("grain") or "").strip().lower()
+    arrival = str(raw.get("arrival") or "").strip()
+    if grain and grain not in GRAINS:
+        raise ValueError(f"{where}.grain must be one of {GRAINS}, got '{raw.get('grain')}'")
+    if not event:
+        raise ValueError(
+            f"{where} is set but {where}.event is missing "
+            f"(which logical name carries the timestamp?)")
+    out = {"event": event}
+    if grain:
+        out["grain"] = grain
+    if arrival:
+        out["arrival"] = arrival
+    return out
+
+
+def lift_task(profile):
+    """The profile's task, whether it was authored as one or not.
+
+    `task_field` reads a task-shaped field from either shape. This completes
+    that idea: it produces the WHOLE task -- kind, clock, keys, whichever
+    pointer names what is predicted, and the covariates -- so everything
+    downstream reads one vocabulary and never asks which shape came in.
+
+    The lift is what makes the split adoptable rather than a migration. A flat
+    profile carrying `time` and `metrics[].role` is not a second code path; it
+    is the same task, spelled the old way, and it compiles to a byte-identical
+    SPEC.
+
+    Returns (task, lifted). `lifted` says the flat shape was used, which is
+    worth reporting: it is the signal that a producer upstream has not moved.
+    """
+    native = profile.get("task")
+    if native is not None and not isinstance(native, dict):
+        raise ValueError("profile.task must be an object when present")
+    # Caught here rather than in the catalog, because the catalog only ever
+    # sees the lifted task -- a field nothing lifts would vanish silently, and
+    # a silently ignored `horizon` on a task is exactly the run-config leak the
+    # split exists to prevent.
+    for k in (native or {}):
+        if k != "kind" and k not in task_library.TASK_FIELDS:
+            raise ValueError(
+                f"task field '{k}' is not part of the task vocabulary "
+                f"({', '.join(task_library.TASK_FIELDS)})")
+
+    raw_kind = str(task_field(profile, "kind") or "forecast").strip().lower()
+    kind = KIND_ALIASES.get(raw_kind, raw_kind)
+    plan = task_library.plan(kind, "profile.kind")
+    task = {"kind": kind}
+
+    # A task authored in full says everything itself; anything it leaves out
+    # still falls back to the flat spelling, so the two can be mixed while a
+    # producer migrates one field at a time.
+    def pick(field):
+        return native.get(field) if isinstance(native, dict) and field in native else None
+
+    clock = _clock_of(pick("clock"), "task.clock")
+    lifted = clock is None
+    if clock is None:
+        clock = _clock_of(profile.get("time"), "profile.time")
+    if clock:
+        task["clock"] = clock
+
+    keys = task_field(profile, "keys")
+    names = []
+    if isinstance(keys, list) and keys:
+        for k in keys:
+            if isinstance(k, str) and k.strip():
+                names.append(k.strip())            # task form: dimension names
+            elif isinstance(k, dict):
+                frm = str(k.get("from") or "").strip()
+                via = str(k.get("via") or "").strip()
+                entry = derive_library.catalog().get(via) if via else None
+                ret = entry["returns"] if entry else ""
+                if ret == "bucket":
+                    continue                       # that is the clock, not a key
+                # A key that supplies its own value still identifies a row, it
+                # just is not a dimension: `row_number` on data that is already
+                # one row per thing has nothing to group by, and dropping it
+                # here would tell the catalog the question had no keys at all.
+                if frm or via:
+                    names.append(frm or via)
+    else:
+        xdeep = profile.get("x-deep") or profile.get("x_deep") or {}
+        if not isinstance(xdeep, dict):
+            raise ValueError("profile.x-deep must be an object when present")
+        series = str(xdeep.get("series") or "").strip()
+        if series:
+            names.append(series)
+    if names:
+        task["keys"] = names
+
+    pointer = task_library.pointer_of(plan) or "target"
+    # "Authored" means the task already says what is predicted or carried. A
+    # clustering says it by naming covariates and no pointer at all -- that is
+    # a complete answer, not a missing one, and reading it as missing sent a
+    # perfectly good task down the role-lifting path to be rejected.
+    named = next((f for f in task_library.POINTERS if pick(f) is not None), None)
+    if named or pick("covariates") is not None:
+        if named:
+            task[named] = native[named]
+        if pick("covariates") is not None:
+            task["covariates"] = native["covariates"]
+        return task, lifted
+
+    # ---- lift roles off the metrics -----------------------------------
+    # A role stamped on a metric grows the metric's enum every time an engine
+    # is added -- a recommender wants `signal`, a classifier wants `label`.
+    # Inverting it, so the task points AT a metric, freezes the metric schema.
+    pointed, covariates = [], []
+    for m in (profile.get("metrics") or []):
+        if not isinstance(m, dict):
+            raise ValueError("each metric must be an object")
+        mname = str(m.get("name") or "").strip()
+        if not mname:
+            raise ValueError("each metric needs a name")
+        role = str(m.get("role") or "").strip().lower()
+        if role not in ROLES:
+            raise ValueError(
+                f"metric '{mname}' needs role one of {ROLES}, got '{m.get('role')}' "
+                f"(or name it under task.{pointer} / task.covariates)")
+        if role == "target":
+            pointed.append(mname)
+        else:
+            covariates.append({
+                "metric": mname,
+                "availability": str(m.get("availability") or "").strip().lower()
+                or "past_only"})
+    if pointed:
+        task[pointer] = pointed
+    if covariates:
+        task["covariates"] = covariates
+    return task, True
 
 
 # --------------------------------------------------------------- the machinery
@@ -249,26 +392,65 @@ class SpecCompilerService(BaseService):
     def _keys_of(profile, naming):
         """The profile's keys, as a list, in a fixed order.
 
-        `profile.keys` is the general form. The named blocks are sugar over it:
-        an x-deep series becomes one key, and a time grain becomes a bin: key.
-        Nothing downstream can tell which form was authored.
+        `profile.keys` is the general form: objects that name their own output
+        column. `task.keys` is the short form, bare dimension names, and the
+        named blocks are sugar over that -- an x-deep series becomes one key,
+        and a time grain becomes a bin: key. Nothing downstream can tell which
+        form was authored.
         """
-        raw = profile.get("keys")
+        # A top-level keys[] outranks task.keys when both are present: the
+        # author who spelled out the output columns has said something the
+        # short form cannot say, and a naming rule must not overwrite it.
+        explicit = profile.get("keys")
+        raw = (explicit if isinstance(explicit, list) and explicit
+               else task_field(profile, "keys"))
+
+        # -- short form: bare dimension names, so the naming rule applies ----
+        # One entity key keeps the shape a single-series forecast has always
+        # emitted; two or more had no legacy spelling to preserve, so they are
+        # prefixed rather than numbered, which reads in a frame header.
+        if isinstance(raw, list) and raw and all(isinstance(k, str) for k in raw):
+            names = [k.strip() for k in raw if k.strip()]
+            multi = len(names) > 1
+            out = []
+            for n in names:
+                out.append({
+                    "name": (("k_" + n) if multi else "series_id") if naming == "v1" else n,
+                    "from": n, "via": "", "origin": f"task.keys = {n}"})
+            grain = str((task_field(profile, "clock") or {}).get("grain")
+                        if isinstance(task_field(profile, "clock"), dict)
+                        else (profile.get("time") or {}).get("grain") or "").strip().lower()
+            if grain:
+                out.append({"name": "t" if naming == "v1" else "period",
+                            "from": "", "via": "bin:" + grain,
+                            "origin": f"task.clock.grain = {grain}"})
+            return out
+
         if isinstance(raw, list) and raw:
             out = []
             for i, k in enumerate(raw):
                 if not isinstance(k, dict):
-                    raise ValueError(f"profile.keys[{i}] must be an object")
+                    raise ValueError(
+                        f"profile.keys[{i}] must be an object, or the whole list "
+                        f"must be bare dimension names (task.keys form)")
                 name = str(k.get("name") or "").strip()
                 frm = str(k.get("from") or "").strip()
                 via = str(k.get("via") or "").strip()
                 if not name:
                     raise ValueError(f"profile.keys[{i}].name is required")
-                if via:
-                    derive_library.resolve(via, f"profile.keys[{i}].via")
-                if not frm and not via.startswith("bin:"):
+                entry = derive_library.resolve(via, f"profile.keys[{i}].via") \
+                    if via else None
+                # Which derives may omit `from` is a property of the derive, not
+                # a prefix on its name: a bin: spine reads the source's own event
+                # time, and a position key reads the row's index. Matching on the
+                # string "bin:" made that a naming convention rather than a fact
+                # the library states about itself.
+                self_supplying = bool(entry) and entry["returns"] in ("bucket",
+                                                                      "position")
+                if not frm and not self_supplying:
                     raise ValueError(
-                        f"profile.keys[{i}] needs a 'from' (only a bin: key may omit it)")
+                        f"profile.keys[{i}] needs a 'from' (only a key whose "
+                        f"derive supplies its own value may omit it)")
                 out.append({"name": name, "from": frm, "via": via,
                             "origin": f"profile.keys[{i}] = {name}"})
             return out
@@ -290,20 +472,21 @@ class SpecCompilerService(BaseService):
                         "origin": f"profile.time.grain = {grain}"})
         return out
 
-    def _walk(self, profile, binding, lib, naming):
+    def _walk(self, profile, task, binding, lib, naming):
         """Yield every obligation the profile raises, in a fixed order.
 
         Lists in list order, catalog `needs` in catalog order. Nothing here
         iterates a set: two runs of the same profile must produce byte-identical
         JSON, not merely equal dicts.
+
+        Reads the lifted `task`, never the flat blocks: by this point there is
+        one vocabulary, and which shape was authored is already forgotten.
         """
         # -- P3 the clock column (the keys carry the grain) ------------------
-        time = profile.get("time") or {}
-        if not isinstance(time, dict):
-            raise ValueError("profile.time must be an object when present")
-        event = str(time.get("event") or "").strip()
+        clock = task.get("clock") or {}
+        event = str(clock.get("event") or "").strip()
         if event:
-            yield Obligation("time_from", logical=event, origin="profile.time.event")
+            yield Obligation("time_from", logical=event, origin="task.clock.event")
 
         # -- P5 keys ---------------------------------------------------------
         for i, k in enumerate(self._keys_of(profile, naming)):
@@ -317,19 +500,26 @@ class SpecCompilerService(BaseService):
         metrics = profile.get("metrics")
         if not isinstance(metrics, list) or not metrics:
             raise ValueError("profile.metrics must be a non-empty list")
-        targets = [m for m in metrics if isinstance(m, dict)
-                   and str(m.get("role") or "").strip().lower() == "target"]
-        single_target = len(targets) == 1
+        # Which metric is predicted comes from the task's pointer, not from a
+        # role on the metric. It decides the v1 column name and nothing else.
+        pointer = task_library.pointer_of(task_library.plan(task["kind"]))
+        pointed = task_library.as_list(task.get(pointer)) if pointer else []
+        cov = {}
+        for c in (task.get("covariates") or []):
+            if isinstance(c, dict):
+                cov[str(c.get("metric") or "").strip()] = \
+                    str(c.get("availability") or "").strip().lower() or "past_only"
+        single_target = len(pointed) == 1
         for j, m in enumerate(metrics):
             if not isinstance(m, dict):
                 raise ValueError("each metric must be an object")
             mname = str(m.get("name") or "").strip()
             if not mname:
                 raise ValueError("each metric needs a name")
-            role = str(m.get("role") or "").strip().lower()
-            if role not in ROLES:
+            if mname not in pointed and mname not in cov:
                 raise ValueError(
-                    f"metric '{mname}' needs role one of {ROLES}, got '{m.get('role')}'")
+                    f"metric '{mname}' is declared but the task never names it "
+                    f"(put it under task.{pointer or 'covariates'} or task.covariates)")
             fn = str(m.get("function") or "").strip()
             if not fn:
                 raise ValueError(f"metric '{mname}' has no function")
@@ -340,14 +530,18 @@ class SpecCompilerService(BaseService):
                     f"(not in the function library: {sorted(lib)})")
 
             if naming == "v1":
-                out = ("y" if (role == "target" and single_target)
-                       else mname if role == "target" else "x_" + mname)
+                out = ("y" if (mname in pointed and single_target)
+                       else mname if mname in pointed else "x_" + mname)
             else:
                 out = mname
             base = f"aggregates[{j}]"
             yield Obligation(f"{base}.name", literal=out, origin=f"metric {mname}")
             yield Obligation(f"{base}.using", literal=fn,
                              origin=f"metric {mname}.function")
+            # `role` is deliberately NOT emitted. Which column you predict is a
+            # modelling decision that changes between runs of the same frame, so
+            # it belongs to the run config. It is still read from the profile
+            # here, to pick the v1 column names and to scaffold that run config.
 
             needs = entry.get("needs", [])
             for need in needs:
@@ -371,18 +565,19 @@ class SpecCompilerService(BaseService):
                 yield Obligation(f"{base}.of", logical=spare,
                                  origin=f"metric {mname}.measure")
 
-            # role and availability describe the modelling task, so they go to
-            # the run config, not the SPEC. What survives into the SPEC is the
-            # part that actually moves data: a covariate that is only knowable
-            # in arrears is anchored to its arrival bucket. A target is a label
-            # and always describes its own period.
-            avail = str(m.get("availability") or "").strip().lower() or "past_only"
-            if role == "feature" and avail not in AVAIL:
-                raise ValueError(
-                    f"feature '{mname}' availability must be one of {AVAIL}, got '{avail}'")
-            if role == "feature" and avail == "past_only":
-                yield Obligation(f"{base}.anchor", literal="arrival",
-                                 origin=f"metric {mname}.availability = past_only")
+            # `availability` DOES reach the SPEC, because it is a fact about the
+            # data rather than about the modelling task: whether a value is
+            # knowable at prediction time is what decides which bucket a late
+            # one lands in. A predicted column is a label and always describes
+            # its own period, so it declares nothing.
+            if mname in cov:
+                avail = cov[mname]
+                if avail not in AVAIL:
+                    raise ValueError(
+                        f"covariate '{mname}' availability must be one of {AVAIL}, "
+                        f"got '{avail}'")
+                yield Obligation(f"{base}.availability", literal=avail,
+                                 origin=f"task.covariates '{mname}'.availability")
 
         # -- P2 filters ------------------------------------------------------
         for n, f in enumerate(profile.get("filters") or []):
@@ -402,61 +597,113 @@ class SpecCompilerService(BaseService):
         # -- P4 validity -----------------------------------------------------
         # A logical arrival name on the profile is resolved like any other; the
         # binding's available_from is already a physical column, so it copies.
-        arrival_logical = str(time.get("arrival") or "").strip()
-        arrival_physical = str(binding.get("available_from") or "").strip()
+        # Only meaningful when there are periods to be re-filed between. A
+        # clustering has no clock, so "when did this become knowable" has no
+        # bucket to answer with, and emitting a guard that can never fire is
+        # noise in the SPEC. The old contract said this per KIND, which forbade
+        # it to a classification even when that classification had a clock.
+        arrival_logical = str(clock.get("arrival") or "").strip()
+        arrival_physical = (str(binding.get("available_from") or "").strip()
+                            if clock else "")
         if arrival_logical:
             yield Obligation("validity.arrival_from", logical=arrival_logical,
-                             origin="profile.time.arrival")
+                             origin="task.clock.arrival")
         elif arrival_physical:
             yield Obligation("validity.arrival_from", literal=arrival_physical,
                              origin="binding.available_from")
 
+    # ----------------------------------------------------------- run config
+
+    @staticmethod
+    def _run_config(profile, task, spec, kind, naming):
+        """The modelling half: which emitted columns are the target(s).
+
+        Column names here are the SPEC's output names, so this is already in
+        the frame's vocabulary — the engine adapter never has to look back at
+        the profile.
+
+        It speaks the run config's vocabulary rather than the kind's: an engine
+        reads `target` whether the task called the thing a signal or a label.
+        Which of those three the question used is still reported, because it is
+        the difference between scoring an interaction and predicting a class.
+        """
+        pointer = task_library.pointer_of(task_library.plan(kind))
+        pointed = set(task_library.as_list(task.get(pointer))) if pointer else set()
+        known_ahead_of = {
+            str(c.get("metric") or "").strip():
+                str(c.get("availability") or "").strip().lower() == "known_ahead"
+            for c in (task.get("covariates") or []) if isinstance(c, dict)}
+
+        targets, features, known_ahead = [], [], []
+        for m, agg in zip([m for m in (profile.get("metrics") or [])
+                           if isinstance(m, dict)], spec.get("aggregates") or []):
+            mname = str(m.get("name") or "").strip()
+            col = agg.get("name")
+            if not col:
+                continue
+            if mname in pointed:
+                targets.append(col)
+            else:
+                features.append(col)
+                if known_ahead_of.get(mname):
+                    known_ahead.append(col)
+
+        rc = {"kind": kind, "pointer": pointer, "targets": targets,
+              "features": features, "known_ahead": known_ahead}
+        if len(targets) == 1:
+            rc["target"] = targets[0]
+        return rc
+
     # ------------------------------------------------------------ contract
 
     @staticmethod
-    def _check(spec, kind, pad, roles):
-        """Hold the emitted SPEC against the contract for this kind.
+    def _check(spec, task, plan, pad):
+        """Hold the emitted SPEC against the task it came from.
 
-        A template fails loudly -- a slot you forgot to fill is a visible empty
-        box. A walk fails by omission, which is quiet. This is what closes that
-        gap, and it is the reason the walk is allowed to be permissive.
+        `task_library.check` already held the PLAN against its kind's row --
+        that a forecast names a target, that a recommender takes exactly two
+        keys, that a clustering was not handed something to predict. This is
+        the other half: a template fails loudly, because a slot you forgot to
+        fill is a visible empty box, but a walk fails by OMISSION, which is
+        quiet. This is what closes that gap, and it is the reason the walk is
+        allowed to be permissive.
 
-        `roles` comes from the profile, not the SPEC: whether a question has a
-        thing to predict is a property of the question. The SPEC deliberately
-        does not record it, because which column an engine predicts is chosen
-        per run and must not move a frame cell.
+        Which keys are the clock comes from what the derive returns, not from
+        the string 'bin:' -- the same fact the library states about itself that
+        `_keys_of` reads.
         """
-        rules = CONTRACT.get(kind)
-        if rules is None:
-            raise ValueError(f"unknown kind '{kind}' (known: {sorted(CONTRACT)})")
+        dlib = derive_library.catalog()
+
+        def returns(k):
+            entry = dlib.get(str(k.get("via") or "").strip())
+            return entry["returns"] if entry else ""
 
         keys = spec.get("keys") or []
-        entity_keys = [k for k in keys if not str(k.get("via") or "").startswith("bin:")]
-        facts = {
-            "time_from": bool(spec.get("time_from")),
-            "time_bin": any(str(k.get("via") or "").startswith("bin:") for k in keys),
-            "targets": "target" in roles,
-            "features": "feature" in roles,
-            "validity": bool((spec.get("validity") or {}).get("arrival_from")),
-        }
-        blame = {"time_from": "time_from", "time_bin": "keys",
-                 "targets": "profile.metrics", "features": "profile.metrics",
-                 "validity": "validity.arrival_from"}
-        for slot, rule in rules.items():
-            if slot == "keys":
-                continue
-            if rule == "R" and not facts[slot]:
+        binned = [k for k in keys if returns(k) == "bucket"]
+        entity = [k for k in keys if returns(k) != "bucket"]
+        clock = task.get("clock") or {}
+
+        if clock:
+            if not spec.get("time_from"):
                 raise ValueError(
-                    f"kind '{kind}' requires '{slot}', but nothing emitted it")
-            if rule == "F" and facts[slot]:
+                    "the task declares a clock, but nothing emitted 'time_from'")
+            if clock.get("grain") and not binned:
                 raise ValueError(
-                    f"kind '{kind}' forbids '{slot}', but "
-                    f"{pad.origin_of(blame[slot])} emitted it")
-        lo, hi = rules["keys"]
-        if not lo <= len(entity_keys) <= hi:
+                    f"the task's clock is grained '{clock['grain']}', but no key bins it")
+        else:
+            if spec.get("time_from"):
+                raise ValueError(
+                    f"the task declares no clock, but {pad.origin_of('time_from')} "
+                    f"emitted 'time_from'")
+            if binned:
+                raise ValueError(
+                    "the task declares no clock, but a key bins one")
+
+        lo, hi = plan["keys_min"], plan["keys_max"]
+        if not lo <= len(entity) <= hi:
             raise ValueError(
-                f"kind '{kind}' needs {lo}..{hi} entity key(s), got {len(entity_keys)} "
-                f"({[k.get('name') for k in entity_keys]})")
+                f"kind '{task['kind']}' needs {lo}..{hi} entity key(s), "
+                f"got {len(entity)} ({[k.get('name') for k in entity]})")
 
     # ------------------------------------------------------------- compile
 
@@ -478,29 +725,42 @@ class SpecCompilerService(BaseService):
         version = str(profile.get("version") or "").strip()
         report["profile"] = f"{name} v{version}".strip() if name else "(unnamed profile)"
 
-        kind = str(profile.get("kind") or "forecast").strip().lower()
-        if kind not in CONTRACT:
-            raise ValueError(f"profile.kind must be one of {sorted(CONTRACT)}, got '{kind}'")
+        # The task is lifted first, so everything after it reads one vocabulary
+        # whether the profile was authored flat or split.
+        task, lifted = lift_task(profile)
+        kind = task["kind"]
         report["kind"] = kind
+        report["task"] = task
+        report["lifted_from_flat"] = lifted
 
-        time = profile.get("time") or {}
-        if not isinstance(time, dict):
-            raise ValueError("profile.time must be an object when present")
-        grain = str(time.get("grain") or "").strip().lower()
-        if grain and grain not in GRAINS:
-            raise ValueError(f"profile.time.grain must be one of {GRAINS}, got '{grain}'")
-        if grain and not str(time.get("event") or "").strip():
-            raise ValueError(
-                "profile.time.grain is set but profile.time.event is missing "
-                "(which logical name carries the timestamp?)")
-
+        metrics = profile.get("metrics")
+        if not isinstance(metrics, list) or not metrics:
+            raise ValueError("profile.metrics must be a non-empty list")
+        metric_names = [str(m.get("name") or "").strip()
+                        for m in metrics if isinstance(m, dict)]
         dim_names = [str(d.get("name") or "").strip()
                      for d in (profile.get("dimensions") or []) if isinstance(d, dict)]
+        # The catalog's dimension check is deliberately NOT run here. The
+        # profile-generator runs it at finalize, where a human is about to sign
+        # and can fix the profile. By this point the binding is in hand, so a
+        # key naming an undeclared dimension still resolves to a real column and
+        # produces a correct frame -- refusing it would reject a profile that
+        # works, and every other catalog rule still applies.
+        plan, kind, pointer, pointed = task_library.check(task, metric_names)
+
         for k in self._keys_of(profile, naming):
             if k["from"] and dim_names and k["from"] not in dim_names:
                 report["warnings"].append(
                     f"key source '{k['from']}' is not listed under dimensions")
-        report["stages"].append("parse+validate: profile is structurally valid")
+        if binding.get("available_from") and not task.get("clock"):
+            report["warnings"].append(
+                f"binding.available_from is set, but a '{kind}' has no clock; "
+                f"there are no periods to re-file between, so no validity "
+                f"block was emitted")
+        report["stages"].append(
+            f"lift+check: '{kind}' task, {len(pointed)} predicted, "
+            f"{len(task.get('covariates') or [])} covariate(s)"
+            + (" (lifted from a flat profile)" if lifted else ""))
 
         # -- stage 2: resolve the binding --------------------------------
         bind = binding.get("bind")
@@ -522,7 +782,7 @@ class SpecCompilerService(BaseService):
 
         # -- stage 4: walk the profile, emit obligations, collect --------
         pad = Pad()
-        for ob in self._walk(profile, binding, lib, naming):
+        for ob in self._walk(profile, task, binding, lib, naming):
             if ob.logical is not None:
                 value = resolve(ob.logical, ob.origin)
                 resolver = "binding"
@@ -556,27 +816,15 @@ class SpecCompilerService(BaseService):
             f"walk+emit: {len(pad.slots)} obligation(s) over "
             f"{len(spec.get('keys', []))} key(s), {len(spec.get('aggregates', []))} aggregate(s)")
 
-        # The profile says what the author wanted to predict; the SPEC does not
-        # carry it. Hand it over as a suggested run config so the engine side
-        # can prefill it - and so overriding it is an explicit, visible act.
-        roles, hint = [], {"target": [], "covariates": [], "known_ahead": []}
-        emitted = spec.get("aggregates") or []
-        for m, agg in zip([m for m in (profile.get("metrics") or [])
-                           if isinstance(m, dict)], emitted):
-            role = str(m.get("role") or "").strip().lower()
-            roles.append(role)
-            col = agg.get("name")
-            if role == "target":
-                hint["target"].append(col)
-            else:
-                hint["covariates"].append(col)
-                if str(m.get("availability") or "past_only").strip().lower() == "known_ahead":
-                    hint["known_ahead"].append(col)
-        report["run_config_hint"] = hint
+        # -- stage 5: check the emitted document -------------------------
+        self._check(spec, task, plan, pad)
 
-        # -- stage 5: check the contract ---------------------------------
-        self._check(spec, kind, pad, roles)
-        report["stages"].append(f"check: SPEC satisfies the '{kind}' contract")
+        # -- stage 6: scaffold the run config ----------------------------
+        # The SPEC says how the frame is built; this says what to do with it.
+        # Splitting them is what lets the same frame answer a different
+        # question — swap the target here and no cell of the frame changes.
+        report["run_config"] = self._run_config(profile, task, spec, kind, naming)
+        report["stages"].append(f"check: SPEC satisfies the '{kind}' task")
         return spec, report
 
     # -------------------------------------------------------------- schema
@@ -616,16 +864,10 @@ class SpecCompilerService(BaseService):
                                 SSP(key="by", type="string",
                                     description="Logical entity for share grouping (group functions like hhi)"),
                                 SSP(key="role", type="enum", required=True,
-                                    description=("target = predict it; feature = carry it "
-                                                 "alongside. Authoring intent only - it does "
-                                                 "not reach the SPEC, it comes back as "
-                                                 "metadata.run_config_hint for the run config"),
+                                    description="target = predict it; feature = carry it alongside",
                                     enum=ParameterEnum(values=list(ROLES))),
                                 SSP(key="availability", type="enum",
-                                    description=("Features only: is it knowable at prediction "
-                                                 "time? Also a run-config concern, except that "
-                                                 "past_only lowers to anchor: arrival, which is "
-                                                 "the part that actually moves data"),
+                                    description="Features only: is it knowable at prediction time?",
                                     enum=ParameterEnum(values=list(AVAIL))),
                             ]),
                         SSP(key="keys", type="array",
@@ -752,8 +994,9 @@ class SpecCompilerService(BaseService):
                             "of": "dollars_obligated", "by": "recipient_parent"}],
         }
         checks["compiled SPEC matches the design doc"] = spec == expected
-        checks["the target is named by the run config, not the SPEC"] = (
-            report["run_config_hint"]["target"] == ["y"])
+        checks["the SPEC says how, the run config says what"] = (
+            "role" not in spec["aggregates"][0]
+            and report["run_config"]["target"] == "y")
 
         # the crosswalk is generated, so it covers the document by construction
         emitted = set()
@@ -798,26 +1041,16 @@ class SpecCompilerService(BaseService):
             aggs2[0]["name"] == "revenue" and aggs2[1]["name"] == "units")
         checks["feature lowered with binding"] = (
             aggs2[2]["name"] == "x_promo" and aggs2[2]["of"] == "promo_flag")
-        checks["no role reaches the spec"] = not any("role" in a for a in aggs2)
-        checks["no availability reaches the spec"] = not any("availability" in a for a in aggs2)
-        checks["known_ahead needs no anchor"] = "anchor" not in aggs2[2]
-        checks["roles surface as a run-config hint instead"] = (
-            report2["run_config_hint"] == {"target": ["revenue", "units"],
-                                           "covariates": ["x_promo"],
-                                           "known_ahead": ["x_promo"]})
+        checks["feature availability copied"] = aggs2[2]["availability"] == "known_ahead"
+        checks["role does NOT reach the spec"] = (
+            not any("role" in a for a in aggs2))
+        checks["roles reach the run config instead"] = (
+            report2["run_config"]["targets"] == ["revenue", "units"]
+            and report2["run_config"]["features"] == ["x_promo"])
+        checks["single target also exposed as run_config.target"] = (
+            report["run_config"].get("target") == "y")
+        checks["run config carries the kind"] = report2["run_config"]["kind"] == "forecast"
         checks["list indices densify past the role split"] = len(aggs2) == 3
-
-        # a past_only covariate is the one role/availability case that moves
-        # data, and it survives as an anchor rather than as a role
-        prof_po = {**prof2, "metrics": [
-            prof2["metrics"][0],
-            {**prof2["metrics"][2], "availability": "past_only"}]}
-        spec_po, rep_po = self._compile(prof_po, bind2)
-        checks["past_only lowers to anchor: arrival"] = (
-            spec_po["aggregates"][1]["anchor"] == "arrival"
-            and "anchor" not in spec_po["aggregates"][0])
-        checks["past_only is not in the known_ahead hint"] = (
-            rep_po["run_config_hint"]["known_ahead"] == [])
 
         # ---- available_from flows through from the binding ----
         bind3 = {**bind2, "available_from": "reported_dt"}
@@ -887,14 +1120,101 @@ class SpecCompilerService(BaseService):
             checks["regress emits no time_from"] = (
                 "time_from" not in kinds["regress: no clock at all"])
         if kinds["cluster: no target at all"]:
-            # nothing in the SPEC says these are features - the contract checked
-            # the profile, and the run config will name no target
+            # The SPEC cannot say "these are features" any more, and does not
+            # need to: a clustering frame is just columns. What must still hold
+            # is that nothing was nominated as a target.
             checks["cluster emits aggregates with no role"] = all(
                 "role" not in a
                 for a in kinds["cluster: no target at all"]["aggregates"])
         if kinds["recommend: two keys"]:
             checks["recommend emits two entity keys"] = (
                 len(kinds["recommend: two keys"]["keys"]) == 2)
+
+        # ---- the same question, authored as a core and a task -------------
+        # The migration rests on this: no producer has to change on the day the
+        # compiler does, and one that has changed gets the same frame.
+        native = {
+            "name": "supplier_concentration", "version": "3",
+            "datasets": [{"name": "awards"}],
+            "metrics": [{"name": "contract_concentration", "function": "hhi",
+                         "measure": "obligation", "by": "vendor"}],
+            "dimensions": [{"name": "category"}, {"name": "vendor"}],
+            "task": {"kind": "forecast",
+                     "clock": {"event": "action_date", "grain": "quarter"},
+                     "keys": ["category"],
+                     "target": "contract_concentration"},
+        }
+        nspec, nrep = self._compile(native, binding)
+        checks["a task-shaped profile compiles byte-identically"] = (
+            json.dumps(nspec) == json.dumps(spec))
+        checks["no metric in a task-shaped profile carries a role"] = not any(
+            "role" in m or "availability" in m for m in native["metrics"])
+        checks["the run config is the same either way"] = (
+            nrep["run_config"] == report["run_config"])
+        checks["a flat profile reports that it was lifted"] = (
+            report["lifted_from_flat"] is True
+            and nrep["lifted_from_flat"] is False)
+        checks["the report echoes the lifted task"] = (
+            report["task"] == {"kind": "forecast",
+                               "clock": {"event": "action_date", "grain": "quarter"},
+                               "keys": ["category"],
+                               "target": ["contract_concentration"]})
+
+        # a covariate carries availability in the task, not on the metric
+        native_cov = {
+            "name": "sales", "version": "1",
+            "metrics": [{"name": "revenue", "function": "sum", "measure": "amount"},
+                        {"name": "promo", "function": "max", "measure": "on_promo"}],
+            "dimensions": [{"name": "store"}],
+            "task": {"kind": "forecast", "clock": {"event": "day", "grain": "week"},
+                     "keys": ["store"], "target": "revenue",
+                     "covariates": [{"metric": "promo", "availability": "past_only"}]},
+        }
+        ncov, _ = self._compile(native_cov, bind2)
+        checks["task covariates lower to availability"] = (
+            ncov["aggregates"][1]["availability"] == "past_only"
+            and "availability" not in ncov["aggregates"][0])
+
+        # the pointer a kind uses is the kind's business, not the author's
+        native_sig = {
+            "name": "recs",
+            "metrics": [{"name": "rating", "function": "mean", "measure": "rating"}],
+            "dimensions": [{"name": "cust"}, {"name": "item"}],
+            "task": {"kind": "recommend", "keys": ["cust", "item"], "signal": "rating"}}
+        sig_spec, sig_rep = self._compile(native_sig, cross_bind)
+        checks["a signal is a pointer like any other"] = (
+            sig_spec["aggregates"][0]["name"] == "y"
+            and sig_rep["run_config"]["target"] == "y")
+        checks["the run config reports which pointer was used"] = (
+            sig_rep["run_config"]["pointer"] == "signal"
+            and report["run_config"]["pointer"] == "target")
+
+        # A leakage guard needs a clock to be a guard against anything. The old
+        # contract said this per KIND, which forbade it to a classification even
+        # when that classification had a clock.
+        clockless_av, cl_rep = self._compile(
+            native_sig, {**cross_bind, "available_from": "reported_dt"})
+        checks["a clockless question emits no validity"] = (
+            "validity" not in clockless_av)
+        checks["and says so rather than dropping it silently"] = any(
+            "no periods to re-file between" in w for w in cl_rep["warnings"])
+        clocked_cl, _ = self._compile(
+            {"name": "risk",
+             "metrics": [{"name": "risk", "function": "label", "measure": "rating"}],
+             "dimensions": [{"name": "cust"}],
+             "task": {"kind": "classify", "keys": ["cust"], "label": "risk",
+                      "clock": {"event": "day", "grain": "week"}}},
+            {**cross_bind, "available_from": "reported_dt"})
+        checks["a clocked classification may still have one"] = (
+            clocked_cl["validity"] == {"arrival_from": "reported_dt"})
+
+        # `anomaly` was the name before the catalog had a row for it
+        checks["the old kind name still resolves"] = (
+            self._compile({**prof2, "kind": "anomaly"}, bind2)[1]["kind"]
+            == "detect_anomaly")
+        checks["every catalogued kind is reachable"] = (
+            set(task_library.kinds()) == {"forecast", "detect_anomaly", "classify",
+                                          "regress", "cluster", "recommend", "rank"})
 
         # ---- validation errors ----
         def fails(prof, bnd, needle, naming="v1"):
@@ -925,20 +1245,65 @@ class SpecCompilerService(BaseService):
         checks["grain without event is rejected"] = fails(
             {**profile, "time": {"grain": "quarter"}}, binding, "event is missing")
 
-        # the contract is what catches a question asking for the wrong shape
+        # the catalog is what catches a question asking for the wrong shape.
+        # It says the same three things the CONTRACT table used to, in the
+        # task's vocabulary rather than the SPEC's: a required field is named
+        # `target`, not `targets`, and a field a kind cannot use is not
+        # "forbidden" but meaningless -- it HAS NO CONCEPT of it.
         checks["forecast without a target is rejected"] = fails(
             {**profile, "metrics": [{"name": "m", "function": "hhi", "measure": "obligation",
                                      "by": "vendor", "role": "feature"}]},
-            binding, "requires 'targets'")
+            binding, "requires 'target'")
         checks["cluster with a target is rejected"] = fails(
-            {**profile, "kind": "cluster"}, binding, "forbids 'targets'")
-        checks["regress with a clock is rejected"] = fails(
-            {**profile, "kind": "regress"}, binding, "forbids 'time_from'")
-        # the key-count rule, on a profile that clears the time rules first
+            {**profile, "kind": "cluster"}, binding, "has no concept of 'target'")
+        # A kind that merely PERMITS a clock now keeps it -- regress over time
+        # is a real question, and the old table forbade it by hand. What is
+        # still rejected is a kind with no concept of one at all.
+        checks["regress with a clock is allowed"] = (
+            compiles("regress", profile, binding) is not None)
+        checks["recommend with a clock is rejected"] = fails(
+            {**recommend, "kind": "recommend",
+             "time": {"event": "day", "grain": "week"}},
+            {**cross_bind, "bind": {**cross_bind["bind"], "day": "date"}},
+            "has no concept of 'clock'")
+        # the key-count rule, on a profile that clears the field rules first
         checks["recommend with one key is rejected"] = fails(
-            {**regress, "kind": "recommend"}, cross_bind, "entity key")
+            {**regress, "kind": "recommend"}, cross_bind, "needs 2..2 key(s)")
+
+        # A field the kind has no concept of is an error, not an ignored hint:
+        # an optional field would mean every engine had to know to skip it, and
+        # nothing would catch a recommender that set a grain by mistake.
+        checks["a task field outside the vocabulary is rejected"] = fails(
+            {**native_sig, "task": {**native_sig["task"], "horizon": 8}},
+            cross_bind, "not part of the task vocabulary")
+        checks["a pointer naming an undeclared metric is rejected"] = fails(
+            {**native_sig, "task": {**native_sig["task"], "signal": "nonesuch"}},
+            cross_bind, "not declared")
+        # A key naming an undeclared dimension is the profile-generator's to
+        # reject at finalize, while a human can still fix it. Here the binding
+        # is in hand, so it resolves to a real column: warn, do not refuse.
+        _, warn_rep = self._compile(
+            {**native_sig, "dimensions": [{"name": "cust"}],
+             "task": {**native_sig["task"], "keys": ["cust", "item"]}}, cross_bind)
+        checks["an undeclared dimension warns rather than refuses"] = any(
+            "not listed under dimensions" in w for w in warn_rep["warnings"])
+        checks["a metric cannot be both predicted and carried"] = fails(
+            {**native_sig, "task": {**native_sig["task"],
+                                    "covariates": [{"metric": "rating"}]}},
+            cross_bind, "both predicted and a covariate")
+        checks["a metric the task never names is rejected"] = fails(
+            {**native_sig, "metrics": native_sig["metrics"] + [
+                {"name": "spare", "function": "count"}]},
+            cross_bind, "never names it")
+        checks["a bad covariate availability is rejected"] = fails(
+            {**native_cov, "task": {**native_cov["task"],
+                                    "covariates": [{"metric": "promo",
+                                                    "availability": "someday"}]}},
+            bind2, "availability must be one of")
 
         # the catalogs must match their embedded fallbacks
+        checks["task csv matches embedded fallback"] = (
+            task_library.catalog() == task_library.embedded_catalog())
         checks["function csv matches embedded fallback"] = (
             function_library.catalog() == function_library.embedded_catalog())
         checks["derive csv matches embedded fallback"] = (

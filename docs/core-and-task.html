@@ -1,0 +1,554 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The core/task split — what main adds to master</title>
+<style>
+  :root{
+    --ink:#141920; --muted:#69737f; --line:#dfe4ea; --bg:#fff;
+    --blue:#1f5fbf;   --blue-soft:#eef4ff;   --blue-brd:#b7d0f0;
+    --purple:#7a2f8a; --purple-soft:#f7ecf9; --purple-brd:#e0c4e8;
+    --green:#1a7a4c;  --green-soft:#e8f6ee;  --green-brd:#a5d6bc;
+    --amber:#9a5b00;  --amber-soft:#fdf3e1;  --amber-brd:#e6c079;
+    --red:#a32a24;    --red-soft:#fdecea;    --red-brd:#eaa9a4;
+    --ai:#0e7490;     --ai-soft:#e6f5f9;     --ai-brd:#9fd3e0;
+    --ink-soft:#f2f4f7;
+    --mono:"SF Mono",Menlo,Consolas,monospace;
+    --sans:"Segoe UI",system-ui,-apple-system,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);
+       font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:62rem;margin:0 auto;padding:2.5rem 1.5rem 6rem}
+
+  h1{font-size:2rem;line-height:1.15;margin:0 0 .35rem;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:1.02rem;margin:0 0 1rem;max-width:46rem}
+  .kicker{font-family:var(--mono);font-size:.7rem;letter-spacing:.13em;
+          text-transform:uppercase;color:var(--muted);margin:0 0 .8rem}
+  h2{font-size:1.28rem;margin:0 0 .2rem;letter-spacing:-.01em}
+  h3{font-size:.95rem;margin:0 0 .3rem}
+  p{margin:0 0 .8rem;max-width:46rem}
+  .lede{color:var(--muted);margin-bottom:1.2rem;max-width:46rem}
+  code{font-family:var(--mono);font-size:.85em;background:var(--ink-soft);
+       padding:.09em .3em;border-radius:3px}
+  a{color:var(--blue)}
+
+  .stage{margin:2.6rem 0 0;padding-top:1.6rem;border-top:2px solid var(--line)}
+  .stage-tag{font-family:var(--mono);font-size:.72rem;letter-spacing:.1em;
+             text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
+
+  .chip{display:inline-block;font-family:var(--mono);font-size:.63rem;font-weight:700;
+        letter-spacing:.06em;text-transform:uppercase;padding:.13rem .4rem;
+        border-radius:3px;border:1px solid;vertical-align:middle;white-space:nowrap}
+  .c-add{background:var(--purple-soft);color:var(--purple);border-color:var(--purple-brd)}
+  .c-kept{background:var(--green-soft);color:var(--green);border-color:var(--green-brd)}
+  .c-chg{background:var(--amber-soft);color:var(--amber);border-color:var(--amber-brd)}
+  .c-gone{background:var(--red-soft);color:var(--red);border-color:var(--red-brd)}
+  .c-ok{background:var(--blue-soft);color:var(--blue);border-color:var(--blue-brd)}
+
+  .legend{display:flex;flex-wrap:wrap;gap:.9rem;padding:.8rem 1rem;background:var(--ink-soft);
+          border:1px solid var(--line);border-radius:6px;margin:0 0 1.4rem;font-size:.82rem}
+  .legend span{display:flex;align-items:center;gap:.4rem;color:var(--muted)}
+
+  .box{border:1px solid var(--line);border-radius:7px;padding:.85rem 1rem;background:var(--bg)}
+  .box.doc{border-color:var(--purple-brd);background:var(--purple-soft)}
+  .box.svc{border-color:var(--blue-brd);background:var(--blue-soft)}
+  .box.good{border-color:var(--green-brd);background:var(--green-soft)}
+  .box h3{margin:0 0 .2rem;display:flex;align-items:baseline;gap:.5rem;flex-wrap:wrap}
+  .box .what{font-size:.87rem;color:var(--muted);margin:0}
+  .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));gap:.7rem;margin:0 0 .2rem}
+
+  details{border:1px solid var(--line);border-radius:6px;margin:.5rem 0 0;background:var(--bg)}
+  details>summary{cursor:pointer;padding:.4rem .7rem;font-family:var(--mono);font-size:.72rem;
+                  letter-spacing:.05em;color:var(--muted);list-style:none}
+  details>summary::-webkit-details-marker{display:none}
+  details>summary::before{content:"▸ ";color:var(--blue)}
+  details[open]>summary::before{content:"▾ "}
+  details .d{padding:.2rem .8rem .75rem;font-size:.88rem}
+  details .d p{margin:0 0 .55rem}
+  details .d p:last-child{margin-bottom:0}
+
+  pre{margin:.5rem 0 0;font-family:var(--mono);font-size:.75rem;line-height:1.65;
+      white-space:pre;overflow-x:auto;background:var(--bg);border:1px solid var(--line);
+      border-radius:5px;padding:.7rem .85rem}
+  pre.tight{margin-top:.3rem}
+  .cmt{color:var(--muted)}
+  .hl{color:var(--blue);font-weight:700}
+  .del{color:var(--red)}
+  .add{color:var(--green)}
+
+  .tw{overflow-x:auto;border:1px solid var(--line);border-radius:6px;margin:0 0 1.1rem}
+  table{border-collapse:collapse;width:100%;font-size:.85rem}
+  th{text-align:left;font-size:.68rem;letter-spacing:.07em;text-transform:uppercase;
+     color:var(--muted);padding:.5rem .8rem;border-bottom:1px solid var(--line);
+     white-space:nowrap;background:var(--ink-soft)}
+  td{padding:.5rem .8rem;border-bottom:1px solid var(--line);vertical-align:top}
+  tbody tr:last-child td{border-bottom:0}
+  td.m{font-family:var(--mono);font-size:.79rem}
+
+  .note{border-left:3px solid var(--blue);background:var(--blue-soft);
+        border-radius:0 6px 6px 0;padding:.75rem .95rem;margin:0 0 1.1rem;font-size:.9rem}
+  .note.warn{border-left-color:var(--amber);background:var(--amber-soft)}
+  .note.good{border-left-color:var(--green);background:var(--green-soft)}
+  .note b.t{display:block;font-family:var(--mono);font-size:.65rem;letter-spacing:.1em;
+            text-transform:uppercase;margin-bottom:.25rem}
+  .note p{margin:0 0 .5rem}
+  .note p:last-child{margin:0}
+
+  footer{margin-top:3.5rem;padding-top:1.2rem;border-top:1px solid var(--line);
+         font-family:var(--mono);font-size:.72rem;color:var(--muted);line-height:1.9}
+  @media print{ details{border:0} details>summary{display:none} details .d{padding:0} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<p class="kicker">SitScape &middot; DEEP &middot; Decision Engine &middot; pipeline lab</p>
+<h1>The core and the task</h1>
+<p class="sub">What <code>main</code> adds on top of <code>master</code>, why each piece is
+there, and what was deliberately left alone.</p>
+<p class="kicker">3 August 2026 &middot; main = master@6573b7f + this &middot; 247 self-tests green</p>
+
+<div class="legend">
+  <span><b class="chip c-add">added</b> new on main</span>
+  <span><b class="chip c-kept">kept</b> master's, untouched on purpose</span>
+  <span><b class="chip c-chg">changed</b> behaviour differs from master</span>
+  <span><b class="chip c-ok">verified</b> checked, not asserted</span>
+</div>
+
+<div class="note">
+  <b class="t">read this first</b>
+  <p><code>main</code> is not a competing implementation. It is <code>master</code> as of
+  <code>6573b7f</code> — every line of it — plus the pieces of the v6 architecture that
+  master did not yet have. <code>mapping_layer.py</code>, <code>app.html</code>,
+  <code>server.py</code> and <code>engine_adapter/</code> are byte-for-byte master's.</p>
+  <p>Three files differ: <code>spec_compiler.py</code>, <code>profile_generator.py</code>,
+  <code>README.md</code>. One file is new: <code>task_library.py</code>, shipped into both
+  service packages the way <code>function_library</code> already is.</p>
+  <p><strong>Every profile master can compile produces a byte-identical SPEC.</strong> That
+  was checked against master's own compiler rather than assumed — see
+  <a href="#verify">verification</a>.</p>
+</div>
+
+<div class="tw"><table>
+  <thead><tr><th>what v6 asks for</th><th>master had</th><th>main adds</th></tr></thead>
+  <tbody>
+    <tr><td><strong>One shared kind catalog</strong></td>
+        <td>Two hand-kept tables — <code>CONTRACT</code> in the compiler,
+            <code>KNOWN_KINDS</code>/<code>CLOCKED_KINDS</code> in the generator</td>
+        <td><b class="chip c-add">added</b> <code>task_library.py</code>, one CSV both
+            services validate against</td></tr>
+    <tr><td><strong>Core and task</strong></td>
+        <td><code>task.{kind, keys}</code>; <code>role</code> and
+            <code>availability</code> still stamped on each metric</td>
+        <td><b class="chip c-add">added</b> the whole task —
+            <code>clock</code>, <code>target</code>/<code>signal</code>/<code>label</code>,
+            <code>covariates</code>. Metrics carry neither.</td></tr>
+    <tr><td><strong>Catalog-driven validation</strong></td>
+        <td>Per-kind require/permit/forbid, by hand, in the compiler only</td>
+        <td><b class="chip c-add">added</b> a field the kind has no concept of is an
+            error, in both services</td></tr>
+    <tr><td><strong>Kind triage from the goal</strong></td>
+        <td>Two of seven — <code>recommend</code>, <code>classify</code></td>
+        <td><b class="chip c-add">added</b> all seven, and scaffolds for the four that
+            had no producer</td></tr>
+    <tr><td><strong>The frame contract</strong></td>
+        <td colspan="2"><b class="chip c-kept">already done</b> master's
+            <code>mapping_layer</code> needed nothing</td></tr>
+  </tbody>
+</table></div>
+
+
+<!-- ============================================================ 1 -->
+<div class="stage">
+<p class="stage-tag">1 &middot; the catalog</p>
+<h2>Two tables became one</h2>
+<p class="lede">The service that WRITES a task and the service that LOWERS it were each
+carrying their own description of the same seven questions, with nothing forcing them to
+agree.</p>
+
+<div class="row">
+  <div class="box">
+    <h3>before <span class="chip c-gone">removed</span></h3>
+    <p class="what">Two files, two vocabularies, no link.</p>
+<pre class="tight"><span class="cmt">// spec_compiler.py</span>
+CONTRACT = {
+  "forecast": {"keys": (0,1),
+     "time_from": "R", "targets": "R",
+     "features": "P", "validity": "P"},
+  <span class="cmt">... six more rows ...</span>
+}
+
+<span class="cmt">// profile_generator.py</span>
+CLOCKED_KINDS = ("forecast", "anomaly")
+KNOWN_KINDS   = ("forecast", "anomaly",
+   "classify", "cluster", "regress",
+   "recommend", "rank")</pre>
+  </div>
+  <div class="box doc">
+    <h3>after <span class="chip c-add">added</span></h3>
+    <p class="what">One row per engine, in a CSV with an identical embedded fallback —
+    the same pattern as the function and derive catalogs.</p>
+<pre class="tight"><span class="cmt">// task_library.py, both services</span>
+kind,requires,permits,keys_min,keys_max
+forecast,clock|target,keys|covariates,0,4
+detect_anomaly,signal,clock|keys|cov…,0,4
+classify,label|keys,clock|covariates,1,4
+regress,target|keys,clock|covariates,1,4
+cluster,keys,clock|covariates,1,4
+recommend,keys|signal,covariates,2,2
+rank,keys|signal,covariates,2,2
+
+<span class="cmt">// the generator no longer keeps its
+// own list — it derives one:</span>
+CLOCKED_KINDS = tuple(k for k in kinds()
+  <span class="hl">if</span> "clock" <span class="hl">in</span> plan(k)["requires"])</pre>
+  </div>
+</div>
+
+<div class="note warn">
+  <b class="t">the drift this caught, immediately</b>
+  <p>The hand-written tuple said <code>CLOCKED_KINDS = ("forecast", "anomaly")</code> — that
+  anomaly detection <em>requires</em> a clock. The catalog says it only <em>permits</em>
+  one: <code>detect_anomaly</code> requires a <code>signal</code>, nothing more.</p>
+  <p>They had disagreed for as long as both existed, because nothing made them agree.
+  Deriving the tuple made the contradiction a test failure on the first run. The
+  consequence is real: <em>"find outliers in customer spend"</em> over a table with no date
+  column is a legitimate question, and it used to be refused.</p>
+</div>
+
+<details><summary>what a kind actually decides</summary><div class="d">
+  <p>Everything downstream. Whether a clock exists at all, how many key columns to pick,
+  which field names what is being predicted, and whether anything is predicted at all.</p>
+  <p><strong>A field a kind has no concept of is an error, not an ignored hint.</strong> An
+  optional field would mean every engine had to know to skip it, and nothing would catch a
+  recommender that set a grain by mistake. So <code>task.horizon</code> is rejected by name,
+  and so is a <code>clock</code> on a <code>recommend</code>.</p>
+</div></details>
+</div>
+
+
+<!-- ============================================================ 2 -->
+<div class="stage">
+<p class="stage-tag">2 &middot; the split</p>
+<h2>A metric stopped having a role</h2>
+<p class="lede">One question sorts every field: with no engine attached, does this still
+describe something real about the data? If yes it is a fact and belongs to the core. If it
+goes meaningless, it was describing the question.</p>
+
+<div class="row">
+  <div class="box">
+    <h3>master</h3>
+    <p class="what">The question is spread across the metric, a <code>time</code> block, an
+    <code>x-deep</code> block and a partial task.</p>
+<pre class="tight">{
+  "metrics": [
+    { "name": "rentals",
+      "function": "sum",
+      "measure": "cnt",
+      <span class="del">"role": "target"</span> },
+    { "name": "promo",
+      "function": "max",
+      "measure": "on_promo",
+      <span class="del">"role": "feature"</span>,
+      <span class="del">"availability": "known_ahead"</span> }
+  ],
+  <span class="del">"time": {"event":"dteday","grain":"day"}</span>,
+  <span class="del">"x-deep": {"series": "store"}</span>,
+  "task": { "kind": "forecast",
+            "keys": [ … ] }
+}</pre>
+  </div>
+  <div class="box doc">
+    <h3>main <span class="chip c-add">added</span></h3>
+    <p class="what">The core says what things mean. The task says what is asked of them.</p>
+<pre class="tight">{
+  "metrics": [
+    { "name": "rentals",
+      "function": "sum",
+      "measure": "cnt" },
+    { "name": "promo",
+      "function": "max",
+      "measure": "on_promo" }
+  ],
+  "dimensions": [{"name": "store"}],
+
+  <span class="hl">"task"</span>: {
+    "kind":   "forecast",
+    <span class="add">"clock"</span>:  {"event":"dteday","grain":"day"},
+    "keys":   ["store"],
+    <span class="add">"target"</span>: "rentals",
+    <span class="add">"covariates"</span>: [
+      {"metric":"promo",
+       "availability":"known_ahead"} ]
+  }
+}</pre>
+  </div>
+</div>
+
+<div class="note">
+  <b class="t">why the role had to move, rather than just be renamed</b>
+  <p>A role stamped on a metric means the metric's schema grows every time an engine is
+  added. A recommender wants <code>role: "signal"</code>; a classifier wants
+  <code>role: "label"</code>; the enum creeps outward forever, and every existing profile
+  has to be re-read whenever it does.</p>
+  <p>Inverting it — the task holds a <strong>pointer</strong> to a metric — freezes the
+  metric schema permanently. <code>task_library</code> is what says which pointer a given
+  kind uses, so adding an eighth engine that predicts something called a
+  <code>ranking</code> is a catalog row, not a change to how a metric is written.</p>
+</div>
+
+<details><summary>the three pointers, and why a clustering has none</summary><div class="d">
+  <p><code>target</code> — a numeric forward-looking question. <code>signal</code> — a value
+  scored when there is no ground-truth label. <code>label</code> — a categorical prediction.
+  They differ only in what the engine calls the thing; at most one is in any kind's
+  <code>requires</code>.</p>
+  <p><code>cluster</code> has none at all, and that is a complete answer rather than a
+  missing one. It requires <code>keys</code> and permits <code>covariates</code>, so every
+  metric rides alongside and nothing is nominated. Handing a clustering a
+  <code>target</code> now fails with <em>"kind 'cluster' has no concept of 'target'"</em>.</p>
+</div></details>
+</div>
+
+
+<!-- ============================================================ 3 -->
+<div class="stage">
+<p class="stage-tag">3 &middot; the migration</p>
+<h2>A flat profile still compiles, byte for byte</h2>
+<p class="lede">The split is only adoptable if nothing has to adopt it on the same day. A
+profile carrying <code>time</code> / <code>x-deep</code> / <code>role</code> is not a second
+code path — it is the same task, spelled the old way.</p>
+
+<div class="box svc">
+  <h3>lift_task(profile) <span class="chip c-add">added</span></h3>
+  <p class="what">Master's <code>task_field()</code> read one field from either shape. This
+  completes the idea: it produces the whole task, so everything after it reads one
+  vocabulary and never asks which shape came in.</p>
+<pre>task, lifted = lift_task(profile)   <span class="cmt"># kind, clock, keys, pointer, covariates</span>
+plan, kind, pointer, pointed = task_library.check(task, metric_names)
+<span class="cmt">#            ^ the catalog is the contract, for both shapes alike</span>
+
+<span class="hl">for</span> ob <span class="hl">in</span> walk(profile, <span class="hl">task</span>, binding, lib, naming):   <span class="cmt"># reads the task, never</span>
+    …                                              <span class="cmt"># the flat blocks</span></pre>
+  <details><summary>what the report tells you</summary><div class="d">
+    <p>The compile report carries <code>lifted_from_flat: true</code> when the old spelling
+    was used. That is not a warning — a flat profile is entirely valid — it is the signal
+    that a producer upstream has not migrated yet, which is the thing you actually want to
+    track during a rollout.</p>
+    <p>It also echoes the lifted <code>task</code>, so you can see exactly what the compiler
+    understood the question to be without re-deriving it by hand.</p>
+  </div></details>
+</div>
+
+<div class="note good">
+  <b class="t">verified, not asserted</b>
+  <p>Master's compiler was loaded side by side with main's and fed the same profiles:
+  x-deep+time+role, two targets with a <code>known_ahead</code> covariate and filters, a
+  <code>past_only</code> covariate, master's own <code>task</code> block, a
+  <code>row_number</code> classification, a clustering, and the legacy <code>anomaly</code>
+  spelling — each under both <code>v1</code> and <code>logical</code> naming, with and
+  without <code>available_from</code>.</p>
+  <p><strong>Every SPEC matched, character for character.</strong> The only divergences were
+  profiles master <em>refused</em> to compile at all; see
+  <a href="#changes">the three behaviour changes</a>.</p>
+</div>
+</div>
+
+
+<!-- ============================================================ 4 -->
+<div class="stage">
+<p class="stage-tag">4 &middot; the front of the pipeline</p>
+<h2>The goal text picks the question — all seven of them</h2>
+<p class="lede">Deterministic regex, checked in a fixed order, in front of the language
+model. Even a total LLM outage still produces a correctly-shaped task.</p>
+
+<div class="tw"><table>
+  <thead><tr><th>goal</th><th>kind</th><th>who scaffolds it</th></tr></thead>
+  <tbody>
+    <tr><td>forecast next quarter's revenue</td><td class="m">forecast</td>
+        <td><b class="chip c-kept">kept</b> master's clocked path</td></tr>
+    <tr><td>recommend items to customers</td><td class="m">recommend</td>
+        <td><b class="chip c-kept">kept</b> <code>_suggest_recommend</code></td></tr>
+    <tr><td>classify which customers churn</td><td class="m">classify</td>
+        <td><b class="chip c-kept">kept</b> <code>_suggest_classify</code></td></tr>
+    <tr><td>rank the top 10 suppliers by spend</td><td class="m">rank</td>
+        <td><b class="chip c-add">added</b> reuses <code>_suggest_recommend</code> — same
+            frame, different question</td></tr>
+    <tr><td>flag unusual spikes in daily spend</td><td class="m">detect_anomaly</td>
+        <td><b class="chip c-add">added</b> clocked path, or entity-keyed with no date</td></tr>
+    <tr><td>segment customers into cohorts</td><td class="m">cluster</td>
+        <td><b class="chip c-add">added</b> <code>_suggest_entity</code></td></tr>
+    <tr><td>estimate a sale price for each home</td><td class="m">regress</td>
+        <td><b class="chip c-add">added</b> <code>_suggest_entity</code></td></tr>
+  </tbody>
+</table></div>
+
+<div class="note">
+  <b class="t">a permitted clock is not an assumed clock</b>
+  <p>A kind that <em>requires</em> a clock always gets one. A kind that merely
+  <em>permits</em> one gets it only if the goal asks for time — otherwise <em>"segment
+  customers"</em> would quietly become <em>"segment customers per month"</em>, which is a
+  different question with a different answer.</p>
+  <p>Adding <code>each month</code> to that same goal puts the clock back. Both are tested.</p>
+</div>
+
+<details><summary>the column the goal named outranks any shape heuristic</summary><div class="d">
+  <p><em>"segment <strong>customers</strong>"</em> keys on <code>cust_id</code> rather than
+  on whatever column happens to sit first and look dimension-shaped. The match is on whole
+  words of the column name, so <code>cust_id</code> is named by "customers" while generic
+  fragments — <code>_id</code>, <code>_nbr</code>, <code>code</code> — prove nothing on
+  their own.</p>
+</div></details>
+</div>
+
+
+<!-- ============================================================ 5 -->
+<div class="stage">
+<p class="stage-tag">5 &middot; restraint</p>
+<h2>What was deliberately left alone</h2>
+<p class="lede">Master's commit <code>6573b7f</code> landed three things that are better than
+what the v6 document describes, or better than what an earlier draft of this work had. They
+were kept, and in one case a worse version was thrown away.</p>
+
+<div class="row">
+  <div class="box good">
+    <h3><code>label()</code> <span class="chip c-kept">kept</span></h3>
+    <p class="what">Folds a categorical column into integer class ids, with the id-to-name
+    mapping in frame metadata.</p>
+    <p style="margin:.5rem 0 0;font-size:.87rem">An earlier draft of this work solved the
+    same problem by letting <code>first</code>/<code>last</code> pass strings through
+    untouched. That was worse on both counts: it put raw text in the frame, and it opened
+    the text path on two functions instead of one. <strong>It was discarded.</strong></p>
+  </div>
+  <div class="box good">
+    <h3><code>row_number</code> <span class="chip c-kept">kept</span></h3>
+    <p class="what">A key whose value is the row's position, for data already one row per
+    thing with no id column — iris, wine, sonar, most classic sets.</p>
+    <p style="margin:.5rem 0 0;font-size:.87rem">Also master's insight that <em>which keys
+    may omit <code>from</code></em> is a property of what the derive RETURNS, not of the
+    string <code>"bin:"</code>. That naming convention was load-bearing in four places of
+    the draft this replaced.</p>
+  </div>
+  <div class="box good">
+    <h3><code>availability</code>, not <code>anchor</code> <span class="chip c-kept">kept</span></h3>
+    <p class="what">v6 renames this field to <code>anchor: event|arrival</code>. Master's
+    own comment already makes v6's argument for it — per column, "a fact about the DATA",
+    absent meaning what targets always had.</p>
+    <p style="margin:.5rem 0 0;font-size:.87rem">So this is a naming difference, not a
+    missing feature, and renaming it would churn 170 green tests to buy nothing.</p>
+  </div>
+</div>
+
+<p style="margin-top:1rem"><code>run_config</code> was kept over v6's earlier
+<code>run_config_hint</code> for the same reason — master's is the later idea, and it already
+does what v6's stage 5 asks for. It gained two fields: <code>pointer</code> (which of
+target/signal/label the question used) and <code>known_ahead</code>.</p>
+
+<p><code>mapping_layer.py</code> was not touched at all. Nothing it does was missing.</p>
+</div>
+
+
+<!-- ============================================================ 6 -->
+<div class="stage" id="changes">
+<p class="stage-tag">6 &middot; judgement calls</p>
+<h2>Three places where behaviour differs from master</h2>
+<p class="lede">Each is a case master <em>rejected</em> and main now accepts. None changes a
+SPEC master could already produce.</p>
+
+<div class="tw"><table>
+  <thead><tr><th>what</th><th>master</th><th>main</th><th>why</th></tr></thead>
+  <tbody>
+    <tr><td><b class="chip c-chg">changed</b> <code>regress</code> with a clock</td>
+        <td>Rejected — the table forbade <code>time_from</code> by hand</td>
+        <td>Compiles</td>
+        <td>The catalog permits it, and regression over time is a real question. The
+            hand-written rule was the accident.</td></tr>
+    <tr><td><b class="chip c-chg">changed</b> <code>validity</code> on a clockless kind</td>
+        <td>Hard error, per kind: classify / cluster / recommend / rank / regress all
+            forbade it</td>
+        <td>Emitted when the task has a clock; omitted with a warning when it does not</td>
+        <td>A leakage guard needs periods to re-file <em>between</em>. The per-kind rule
+            also refused it to a <strong>clocked</strong> classification, which legitimately
+            wants one.</td></tr>
+    <tr><td><b class="chip c-chg">changed</b> a key naming an undeclared dimension</td>
+        <td>Warning in the compiler</td>
+        <td>Still a warning in the compiler; a hard error at <code>finalize</code></td>
+        <td>The catalog would make it an error everywhere, but by compile time the binding
+            is in hand and the key resolves to a real column — refusing would reject a
+            profile that works. The gate belongs where a human is about to sign.</td></tr>
+  </tbody>
+</table></div>
+
+<details><summary>two bugs the integration surfaced, both now covered</summary><div class="d">
+  <p><strong>A <code>row_number</code> key never reached <code>task.keys</code>.</strong> It
+  has no <code>from</code>, so the name-extraction skipped it and the catalog was told a
+  classification had no keys at all. It identifies a row without being a dimension, so it
+  now contributes its derive name.</p>
+  <p><strong><code>finalize</code> dropped authored key objects.</strong> It read
+  <code>task.keys</code> in preference to a top-level <code>keys[]</code>, so running it over
+  its own output discarded the objects — and with them the only spelling a
+  <code>row_number</code> key has. Every iris-shaped classification would have broken. It now
+  uses the same precedence the compiler does.</p>
+  <p>Neither was reachable from master's own tests, because master's generator never
+  produced a task and its compiler never round-tripped one.</p>
+</div></details>
+</div>
+
+
+<!-- ============================================================ 7 -->
+<div class="stage" id="verify">
+<p class="stage-tag">7 &middot; verification</p>
+<h2>What was actually run</h2>
+
+<div class="row">
+  <div class="box">
+    <h3>self-tests</h3>
+<pre class="tight">                  master   main
+profile-generator   22  ->   78
+spec-compiler       52  ->   73
+mapping-layer       54  ->   54  <span class="cmt">untouched</span>
+engine-adapter      42  ->   42  <span class="cmt">untouched</span>
+                   ---      ---
+                   170  ->  247   <span class="add">all green</span></pre>
+  </div>
+  <div class="box">
+    <h3>six goals, one schema, through every service</h3>
+    <p class="what">Over the HTTP API on <code>interactions.csv</code>, changing nothing but
+    the sentence.</p>
+<pre class="tight">forecast        series_id | t | y
+recommend       k_cust_id | k_item_sku | y
+classify        k_cust_id | y | x_mean_stars | …
+cluster         series_id | x_sum_stars | …
+rank            k_cust_id | k_item_sku | y
+detect_anomaly  series_id | t | y</pre>
+  </div>
+</div>
+
+<p style="margin-top:1rem">Also swept: all four bundled datasets end to end
+(<code>awards</code>, <code>retail</code>, <code>interactions</code>,
+<code>movielens</code>), and an iris-shaped classification to exercise the
+<code>row_number</code> and <code>label</code> paths together — <code>y</code> comes out as
+<code>0/1/2</code> with <code>{"setosa","versicolor","virginica"}</code> in frame metadata,
+exactly as master designed it.</p>
+
+<div class="note warn">
+  <b class="t">not done</b>
+  <p>Nothing is committed. The three modified files and the two copies of
+  <code>task_library.py</code> are sitting in the working tree.</p>
+  <p><code>docs/spec-reference.html</code> was re-read and still holds: it documents the
+  SPEC, and the SPEC did not change. It has nothing to say about the core/task split, which
+  is what this page is for.</p>
+</div>
+</div>
+
+<footer>
+SitScape internal &middot; the core/task split &middot; 3 August 2026<br>
+main = master@6573b7f + task_library + the full task vocabulary + seven-kind triage<br>
+companion to pipeline-flowchart-v6.html (the architecture) and docs/spec-reference.html (the SPEC)<br>
+services: profile_generator 78 checks &middot; spec_compiler 73 &middot; mapping_layer 54 &middot; engine_adapter 42 &mdash; 247 green
+</footer>
+
+</div>
+</body>
+</html>

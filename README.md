@@ -23,8 +23,69 @@ needs `pydantic-settings`, so the four classes the services actually touch are
 stubbed; `spl.services` is mapped at `./services`, which keeps each service's own
 `function_library` / `derive_library` copy separate exactly as in production.
 
-The badge in the top right runs all three self-tests on load (123 checks). If it
-is red, the services are broken, not the lab.
+The badge in the top right runs every service's self-tests on load (247 checks).
+If it is red, the services are broken, not the lab.
+
+## The profile is a core and a task
+
+One question sorts every field of a profile: with no engine attached, does this
+still describe something real about the data?
+
+```jsonc
+{ "metrics":    [{ "name": "rentals", "function": "sum", "measure": "cnt" }],
+  "dimensions": [{ "name": "store" }],
+
+  "task": { "kind":   "forecast",
+            "clock":  { "event": "dteday", "grain": "day" },
+            "keys":   ["store"],
+            "target": "rentals",
+            "covariates": [{ "metric": "promo", "availability": "known_ahead" }] } }
+```
+
+A metric is now purely **how to compute a quantity** — no role, no availability,
+no time — which is true whether or not an engine ever runs. Everything that goes
+meaningless without an engine is in the task.
+
+That inversion is what freezes the metric schema. A role stamped on a metric
+grows its enum every time an engine is added: a recommender wants
+`role: "signal"`, a classifier wants `role: "label"`. A task holding a *pointer*
+to a metric does not.
+
+Which pointer each kind uses, whether it has a clock, and how many keys it takes
+all live in one table — `task_library.py`, a CSV with an identical embedded
+fallback, the same pattern as `function_library` and `derive_library`. Both the
+profile-generator (which writes tasks) and the spec-compiler (which lowers them)
+validate against it, so they cannot drift apart. It replaced a hand-kept
+`CONTRACT` dict in one service and a `KNOWN_KINDS`/`CLOCKED_KINDS` pair in the
+other — two tables describing the same seven questions, with nothing forcing
+them to agree. **Adding an engine is a row.**
+
+| kind | requires | permits | keys |
+|---|---|---|---|
+| `forecast` | clock, target | keys, covariates | 0..4 |
+| `detect_anomaly` | signal | clock, keys, covariates | 0..4 |
+| `classify` | label, keys | clock, covariates | 1..4 |
+| `regress` | target, keys | clock, covariates | 1..4 |
+| `cluster` | keys | clock, covariates | 1..4 |
+| `recommend` | keys, signal | covariates | 2..2 |
+| `rank` | keys, signal | covariates | 2..2 |
+
+A field a kind has no concept of is an **error**, not a silently ignored hint —
+otherwise every engine would have to know to skip it, and nothing would catch a
+recommender that set a grain by mistake.
+
+**The kind comes from the goal text**, by deterministic regex in a fixed order,
+in front of the language model. Even a total LLM outage still produces a
+correctly-shaped task. A kind that *requires* a clock always gets one; a kind
+that merely *permits* one gets it only if the goal asks for time — otherwise
+"segment customers" would quietly become "segment customers per month", which is
+a different question.
+
+**A flat profile still compiles.** One carrying `time` / `x-deep` /
+`metrics[].role` / `availability` is lifted into a task on the way in and
+produces a byte-identical SPEC, so no producer has to migrate on the same day
+the compiler does. The compile report says `lifted_from_flat` when that
+happened, which is the signal that something upstream has not moved yet.
 
 ## Layout
 
@@ -68,16 +129,9 @@ that tree. On `ss_spl`, `main` is protected: branch, then merge request.
 the profile. Same numbers either way — that is the point of the toggle.
 
 **run config** — lives entirely in the browser and is echoed back untouched.
-Change the horizon, the season, the engine, **or the target column**, and re-run:
-**every cell of the frame must be identical.** That is the invariant the
-SPEC/run-config split exists to protect, and this panel is how you check it
-rather than assume it.
-
-The target picker is the point. The SPEC aggregates; it does not say which
-column is the thing being predicted, because that is a per-run decision. The
-compiler still reports what the profile *intended* as
-`metadata.run_config_hint`, which is what prefills the picker — a suggestion you
-can override without recompiling anything.
+Change the horizon, the season, the engine, and re-run: **every cell of the frame
+must be identical.** That is the invariant the SPEC/run-config split exists to
+protect, and this panel is how you check it rather than assume it.
 
 **adapter compatibility** — the checks that will move into the engine adapter
 once the run config is real: season length against the grain, horizon against
@@ -95,32 +149,30 @@ to poke directly at frame generation.
 
 ## Things worth trying
 
-- **Clustering.** Edit the SPEC to one key and no `time_from`, then set the
-  target picker to *(none — unsupervised)*. It works, and note that the SPEC
-  itself is unchanged from the supervised case: nothing in it ever said which
-  column was a target. Under the old pipeline this died at
-  `spec_compiler.py:246`, and even with that removed the mapping layer returned
-  an empty frame because the `got_any` gate only counted targets.
+- **Six questions, one schema.** Point at `interactions.csv` and ask, in turn:
+  *forecast total line_total per item each month*, *recommend items to
+  customers*, *classify each customer by status*, *segment customers into
+  cohorts*, *rank the top 3 items for each customer*, *flag unusual spikes in
+  monthly spend*. Nothing else changes. Every one picks its own kind from the
+  sentence, and the frame contract is the same rule each time — keys, plus `t`
+  when a key bins a clock, plus one column per aggregate.
+
+- **Clustering, just by asking.** "segment customers into cohorts" produces it
+  directly: no clock, no target, every metric carried alongside. It used to need
+  a hand-edited SPEC, because `_finalize` demanded a `time.event` of every
+  profile and the contract table forbade a clustering a target it never had.
+  Note the SPEC is unchanged in shape from the supervised case: nothing in it
+  ever said which column was a target.
 
 - **A composite key.** Add a second entry to `keys[]`. The old `series_from` was
   a single string, so this was unrepresentable.
 
 - **The leakage guard.** Add `"validity": {"arrival_from": "reported_dt"}` to the
-  awards SPEC and set an aggregate's `"anchor": "arrival"`. The Sept 27 award was
-  not reported until Oct 30, so that column's value is re-filed forward into Q4 —
-  producing a Q4 row with a **null in the event-anchored column and a live value
-  in the arrival-anchored one**. The counter reads
+  awards SPEC. The Sept 27 award was not reported until Oct 30, so as a
+  `past_only` feature it is re-filed forward into Q4 — producing a Q4 row with a
+  **null target and a live feature**. The counter reads
   `features_refiled_forward: 1`. That row existing at all is the guard and the
   `got_any` fix working together.
-
-- **Two anchors, one measure.** Aggregate the same column twice, once with
-  `anchor: "event"` and once with `anchor: "arrival"`. You get both the as-it-
-  happened and the as-you-knew-it series side by side, from one pass. This is
-  what `anchor` buys over the old `role` + `availability` pair, which could only
-  express it by pretending one of them was a target.
-
-- **Role is gone.** Put `"role": "target"` on an aggregate. It is rejected, and
-  the message points at the run config.
 
 - **A gap, not a default.** Set a key's `via` to `bin:fortnight`. It fails loudly
   and lists the catalog. The old code silently defaulted a missing grain to
