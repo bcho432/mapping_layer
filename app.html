@@ -68,6 +68,13 @@
   button{font-family:inherit;font-size:.85rem;font-weight:700;cursor:pointer;
     background:var(--accent);color:#fff;border:0;border-radius:3px;padding:.5rem .9rem}
   button.ghost{background:transparent;color:var(--accent);border:1px solid var(--line);font-weight:400}
+  .newrow{border:1px solid var(--line);border-radius:5px;padding:.7rem;margin:.5rem 0}
+  .newrow .f{display:grid;grid-template-columns:9rem 1fr;gap:.5rem;align-items:center;
+    margin-bottom:.35rem}
+  .newrow .f label{font-family:var(--mono);font-size:.7rem;color:var(--dim);margin:0}
+  .newrow .f input{width:100%}
+  .newrow .f.target label{color:var(--accent)}
+  .newrow .f.target input{opacity:.5}
   button:disabled{opacity:.5;cursor:default}
   :root[data-x] button{color:#fff}
   @media (prefers-color-scheme: dark){ button{color:#15121D} }
@@ -175,6 +182,16 @@
             <span id="csvnote" class="hint"></span>
           </span>
           <textarea id="csv" rows="7" spellcheck="false"></textarea>
+          <button id="addrow" type="button" class="ghost">+ predict a new row</button>
+          <span id="addrownote" class="hint"></span>
+          <div id="newrow" class="newrow" hidden>
+            <p class="hint" id="newrowhead" style="padding:0 0 .4rem"></p>
+            <div id="newrowfields"></div>
+            <div class="row" style="margin-top:.6rem">
+              <button id="newrowgo" type="button" class="ghost">predict it</button>
+              <button id="newrowcancel" type="button" class="ghost">cancel</button>
+            </div>
+          </div>
         </label>
       </div>
     </section>
@@ -302,6 +319,13 @@ async function boot() {
   // A file picker is a convenience over the same textarea: the file is read
   // locally with FileReader and its text dropped into #csv, so /api/run keeps
   // receiving exactly what a paste would have sent.
+  $('addrow').hidden = true;                    // until a run says the task fits
+  $('addrow').addEventListener('click', openNewRow);
+  $('newrowcancel').addEventListener('click', () => {
+    $('newrow').hidden = true; $('addrownote').textContent = '';
+  });
+  $('newrowgo').addEventListener('click', submitNewRow);
+
   $('engine').addEventListener('change', engineHint);
   engineHint();
   $('reader').addEventListener('change', () => { readerHint(); run(); });
@@ -381,6 +405,130 @@ function recTable(preds) {
     }).join('') + '</tr>').join('') + '</tbody></table>';
 }
 
+// --- predict a new row ------------------------------------------------------
+// A blank-label row appended to a raw CSV textarea is unreadable — you cannot
+// tell which comma is which column, and it is trivial to get the wrong one
+// blank. The header is parsed instead and rendered as named fields, with the
+// label column shown but disabled: you can see exactly what is being predicted.
+
+function csvHeader() {
+  const first = ($('csv').value || '').split(/\r?\n/)[0] || '';
+  return first ? splitCsvLine(first) : [];
+}
+
+function splitCsvLine(line) {
+  const out = []; let cur = '', q = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') q = false;
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { out.push(cur); cur = ''; }
+    else cur += c;
+  }
+  out.push(cur);
+  return out.map(v => v.trim());
+}
+
+function csvCell(v) {
+  const s = String(v == null ? '' : v);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// Which physical column holds the label. Read from the last run's profile and
+// binding rather than guessed: the profile names a LOGICAL measure, and the
+// binding says which column that is. Falling back to the last column is what
+// blanked 'Embarked' instead of 'Survived'.
+function targetColumn() {
+  const r = LAST || {};
+  const prof = r.profile || {}, bind = (r.binding || {}).bind || {};
+  const t = (prof.metrics || []).find(m => m.role === 'target');
+  if (t && t.measure) return bind[t.measure] || t.measure;
+  return null;
+}
+
+// Only classification predicts a THING you supply. A forecast predicts periods
+// the horizon already generates, and a recommendation predicts items the user
+// has not seen — both produce their unknowns from the data they already have.
+// Offering "add a row" there would be a control that does nothing, which is the
+// same failure as the run-config knobs that were echoed and never read.
+function newRowApplies() {
+  const em = (LAST || {}).engine_meta;
+  return !!em && em.task === 'classify';
+}
+
+function paintNewRow() {
+  const em = (LAST || {}).engine_meta;
+  const on = newRowApplies();
+  $('addrow').hidden = !on;
+  if (!on) {
+    $('newrow').hidden = true;
+    $('addrownote').textContent = !em ? ''
+      : em.task === 'forecast'
+        ? 'A forecast predicts future periods \u2014 set the horizon rather than adding rows.'
+      : em.task === 'recommend'
+        ? 'A recommendation already predicts every item a user has not seen.'
+      : '';
+  }
+}
+
+function openNewRow() {
+  const header = csvHeader();
+  if (header.length < 2) {
+    $('addrownote').textContent = 'Load a CSV first.'; return;
+  }
+  const tcol = targetColumn();
+  if (!tcol) {
+    $('addrownote').textContent =
+      'Run the pipeline once first \u2014 the label column comes from the profile.';
+    return;
+  }
+  $('newrowhead').textContent =
+    `Fill in what you know. '${tcol}' is what gets predicted, so it stays blank. ` +
+    'Anything you leave empty makes the row unscorable.';
+  $('newrowfields').innerHTML = header.map((h, i) => {
+    const isT = h === tcol;
+    return `<div class="f${isT ? ' target' : ''}">` +
+      `<label for="nrf${i}">${esc(h)}${isT ? ' \u2190 predicted' : ''}</label>` +
+      `<input id="nrf${i}" ${isT ? 'disabled placeholder="\u2014"' : ''}></div>`;
+  }).join('');
+  $('newrow').hidden = false;
+  $('addrownote').textContent = '';
+  const first = $('newrowfields').querySelector('input:not([disabled])');
+  if (first) first.focus();
+}
+
+function submitNewRow() {
+  const header = csvHeader();
+  const tcol = targetColumn();
+  const cells = header.map((h, i) => {
+    if (h === tcol) return '';
+    const el = $('nrf' + i);
+    return el ? el.value.trim() : '';
+  });
+  const filled = cells.filter((c, i) => header[i] !== tcol && c !== '').length;
+  if (!filled) {
+    $('addrownote').textContent = 'Fill in at least one field.'; return;
+  }
+  const box = $('csv');
+  box.value = box.value.replace(/\s+$/, '') + '\n' +
+              cells.map(csvCell).join(',') + '\n';
+  $('newrow').hidden = true;
+  $('addrownote').textContent =
+    `Row added with '${tcol}' blank \u2014 running\u2026`;
+  // go(), not run(): the Run button's id is "run", so the browser binds `run`
+  // to that ELEMENT as a global. Calling run() therefore threw "not a function"
+  // rather than failing as an undefined name, and the note sat at "running..."
+  // forever with no error anyone would notice.
+  go();
+}
+
+function todoCount(preds) {
+  return (preds || []).filter(p => p.is_prediction === 'yes').length;
+}
+
 function paintEngine(r) {
   const em = r.engine_meta, preds = r.predictions || [];
   $('engtitle').textContent =
@@ -438,7 +586,9 @@ function paintEngine(r) {
   if (em.task === 'classify') {
     const k = a.n_classes;
     $('engcount').className = 'pill ' + ((a.lift_over_baseline || 0) > 0 ? 'ok' : 'warn');
-    $('engcount').textContent = `${a.rows_scored} rows \u00b7 ${k} classes`;
+    $('engcount').textContent = todoCount(preds)
+      ? `${todoCount(preds)} to predict \u00b7 ${a.rows_scored} scored`
+      : `${a.rows_scored} rows \u00b7 ${k} classes`;
 
     const tiles = [
       ['accuracy', a.accuracy, false],
@@ -455,10 +605,45 @@ function paintEngine(r) {
       `<div class="stat${bad ? ' bad' : ''}"><b>${esc(val)}</b><span>${esc(kk)}</span></div>`
     ).join('');
 
+    // The rows with no known outcome come FIRST. They are the deliverable —
+    // the list you act on — and everything below them is the evidence that
+    // acting on them is reasonable. Buried mid-table they read as leftovers.
+    const todo = preds.filter(p => p.is_prediction === 'yes');
+    const dead = preds.filter(p => p.is_prediction === 'unscorable');
+    let head = '';
+    if (todo.length) {
+      const keyCol = Object.keys(todo[0]).find(k => k !== 'yhat' &&
+        k !== 'proba' && k !== 'is_prediction' && k !== em.target) ||
+        Object.keys(todo[0])[0];
+      const ranked = todo.slice().sort((x, y) => (y.proba || 0) - (x.proba || 0));
+      head = '<p class="note" style="margin:.2rem 0 .5rem">' +
+        `<strong>${todo.length} row${todo.length === 1 ? '' : 's'} with no known ` +
+        `outcome</strong> \u2014 predicted by a model fitted on every labelled row. ` +
+        'This is the list to act on.</p>' +
+        '<table class="fc"><thead><tr>' +
+        `<th>${esc(keyCol)}</th><th>predicted</th><th>confidence</th>` +
+        '</tr></thead><tbody>' +
+        ranked.map(p => {
+          const pc = p.proba === null || p.proba === undefined ? null
+                   : Math.round(p.proba * 100);
+          const unsure = pc !== null && pc >= 40 && pc <= 60;
+          return `<tr><td class="k">${esc(p[keyCol])}</td>` +
+            `<td class="fc">${esc(p.yhat)}</td>` +
+            `<td class="${unsure ? '' : 'fc'}">${pc === null ? '\u2014' : pc + '%'}` +
+            `${unsure ? ' &middot; coin flip' : ''}</td></tr>`;
+        }).join('') + '</tbody></table>';
+    }
+    if (dead.length) {
+      head += `<p class="note">${dead.length} row(s) could not be predicted at ` +
+        `all: ${esc(a.unscorable_reason || 'a feature was missing')}. Those are ` +
+        'not predictions and are not counted anywhere.</p>';
+    }
+    if (head) head += '<hr style="border:0;border-top:1px solid var(--line);margin:1rem 0">';
+
     // Per-class first: accuracy hides a class the model cannot find, and that
     // class is usually the one the question was asked about.
     const cls = Object.keys(a.per_class);
-    let html = '<table class="fc"><thead><tr><th>class</th><th>precision</th>' +
+    let html = head + '<table class="fc"><thead><tr><th>class</th><th>precision</th>' +
       '<th>recall</th><th>F1</th><th>rows</th></tr></thead><tbody>' +
       cls.map(c => {
         const m = a.per_class[c];
@@ -704,6 +889,7 @@ function drawFrame(r) {
   $('frame').innerHTML = `<table><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
   paintEngine(r);
   paintKnobs(r.engine_meta);
+  paintNewRow();
   $('framenote').textContent =
     `Column names come from the SPEC (naming = ${$('naming').value}). ` +
     `Keys: ${(r.frame_meta.keys || []).join(', ')}.`;

@@ -348,11 +348,29 @@ class ProfileGeneratorService(BaseService):
         if not date_col:
             if kind not in CLOCKED_KINDS:
                 return self._suggest_entity(cols, goal, goal_l, dataset, warnings, kind)
-            raise ValueError(
-                f"no time column found in the schema, but a '{kind}' needs one "
-                f"(a date/timestamp column). Kinds that need no clock: "
-                f"{', '.join(sorted(k for k in CLOCKLESS_KINDS if k != kind))} "
-                f"— say so in the goal.")
+
+            # This used to raise, and a raise here VETOES THE LANGUAGE MODEL.
+            # The scaffold always runs first and the LLM stage corrects its
+            # draft, so refusing at this point halts the pipeline before the
+            # model ever reads the sentence. `triage` reads "predict who will
+            # survive" as a forecast; the file has no clock; the run died --
+            # while the model, given any draft at all, names the label
+            # immediately. A keyword regex must not decide whether the reader
+            # gets to read.
+            #
+            # So demote to the clockless kind the data can actually support and
+            # say so. A wrong guess is one stage from being fixed; a refusal is
+            # not fixable at all.
+            text_lab, num_lab = self._label_candidates(cols)
+            demoted = "classify" if (text_lab or num_lab) else "regress"
+            warnings.append(
+                f"the goal reads as a '{kind}', but this file has no date "
+                f"column, so a clock is impossible; drafted a '{demoted}' "
+                f"instead -- say what you want in the goal")
+            if demoted == "classify":
+                return self._suggest_classify(cols, goal, goal_l, dataset, warnings)
+            return self._suggest_entity(cols, goal, goal_l, dataset, warnings,
+                                        demoted)
 
         # -- grain: explicit override, else goal keyword, else month -----
         grain = str(p.get("grain") or "").strip().lower()
@@ -540,6 +558,40 @@ class ProfileGeneratorService(BaseService):
 
     # ------------------------------------------------------- suggest: classify
 
+    def _label_candidates(self, cols):
+        """Columns that could plausibly hold a class label, best first.
+
+        Extracted so the classify scaffold and the no-clock demotion ask the
+        same question. Two rules that drifted apart would be worse than either:
+        the demotion would offer a classification the scaffold then could not
+        build.
+
+        Text first, then numerics whose VALUE SHAPE looks like a class id -- a
+        whole number from a small run. 71.78 is never a class, however few times
+        it appears, and counting distinct values conflated the two.
+        """
+        def few_values(c, hi):
+            n = c.get("cardinality")
+            return isinstance(n, (int, float)) and 1 < n <= hi
+
+        def looks_like_a_class(c):
+            sample = str(c.get("sample") or "").strip()
+            if not sample:
+                return False
+            try:
+                v = float(sample)
+            except ValueError:
+                return False
+            return v == int(v) and abs(v) < 1000
+
+        text = [c for c in cols
+                if not self._is_date(c) and not self._is_number(c)
+                and few_values(c, 20)]
+        numeric = [c for c in cols
+                   if self._is_number(c) and not self._is_date(c)
+                   and few_values(c, 20) and looks_like_a_class(c)]
+        return text, numeric
+
     def _suggest_classify(self, cols, goal, goal_l, dataset, warnings):
         """A labelled table: one row per thing, one categorical column to predict.
 
@@ -551,44 +603,7 @@ class ProfileGeneratorService(BaseService):
         """
         # The label: a categorical column with few distinct values. A column the
         # goal actually names wins, because that is the user being explicit.
-        def few_values(c, hi):
-            n = c.get("cardinality")
-            return isinstance(n, (int, float)) and 1 < n <= hi
-
-        def looks_like_a_class(c):
-            """Value SHAPE, not value count.
-
-            A class id is a whole number from a small contiguous run — 1..7, or
-            0/1. A measurement that happens to take few distinct values is not:
-            71.78 is never a class. Counting distinct values conflated the two,
-            and the count is the weaker signal of the two by far.
-            """
-            sample = str(c.get("sample") or "").strip()
-            if not sample:
-                return False
-            try:
-                v = float(sample)
-            except ValueError:
-                return False
-            return v == int(v) and abs(v) < 1000
-
-        cands = [c for c in cols
-                 if not self._is_date(c) and not self._is_number(c)
-                 and few_values(c, 20)]
-        # A 0/1 flag is the most common binary label there is, and it is numeric.
-        # Excluding numbers outright rejected every dataset that spells its
-        # label that way — pima, titanic, most churn exports. The bar is much
-        # tighter than for text: a numeric column is only a label candidate when
-        # it takes a handful of values, and it ranks below any text candidate.
-        # The cap was 5, which rejected any problem with six or more classes —
-        # glass, digits, most multi-class data. It is now loose enough that a
-        # real label always reaches the candidate list, because the cost of
-        # missing one is a HARD FAILURE: this runs before the LLM stage, so a
-        # refusal here stops the model ever seeing a draft to correct. Guessing
-        # badly is recoverable one stage later; refusing is not.
-        numeric_cands = [c for c in cols
-                         if self._is_number(c) and not self._is_date(c)
-                         and few_values(c, 20) and looks_like_a_class(c)]
+        cands, numeric_cands = self._label_candidates(cols)
         named = [c for c in (cands + numeric_cands) if c["name"].lower() in goal_l]
         pool = cands or numeric_cands
         if named:
@@ -1321,13 +1336,29 @@ class ProfileGeneratorService(BaseService):
         checks["recommend: scores a signal, not a target"] = (
             "signal" in rec["task"] and "target" not in rec["task"])
 
-        # ---- suggest edge: no time column is an error ----
+        # ---- suggest edge: no time column DEMOTES, it does not error ----
+        # This asserted a raise. Refusing here vetoes the language model: the
+        # scaffold always runs first and the LLM stage corrects its draft, so a
+        # raise halts the pipeline before the model reads the sentence at all.
+        # The contract is now "always emit a draft, and say what you demoted".
         try:
-            self._suggest({"goal": "sales", "schema": [{"name": "sales", "type": "number"}]})
-            checks["suggest without a time column errors"] = False
-        except ValueError as e:
-            checks["suggest without a time column errors"] = (
-                "time column" in str(e) and "cluster" in str(e))
+            prof_nc, rep_nc = self._suggest({
+                "goal": "predict who will survive",
+                "schema": [{"name": "fare", "type": "number", "sample": "7.25",
+                            "cardinality": 200},
+                           {"name": "survived", "type": "number", "sample": "1",
+                            "cardinality": 2},
+                           {"name": "pid", "type": "string", "sample": "p1",
+                            "cardinality": 300}]})
+            checks["no clock demotes instead of raising"] = True
+            checks["the demoted draft is clockless"] = (
+                "clock" not in (prof_nc.get("task") or {}))
+            checks["and it names the demotion"] = any(
+                "drafted a" in w for w in rep_nc.get("warnings", []))
+        except ValueError:
+            checks["no clock demotes instead of raising"] = False
+            checks["the demoted draft is clockless"] = False
+            checks["and it names the demotion"] = False
 
         # ---- suggest fallback: hhi asked for but no entity -> sum ----
         prof3, rep3 = self._suggest({
