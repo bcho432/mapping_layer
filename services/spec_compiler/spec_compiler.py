@@ -389,6 +389,23 @@ class SpecCompilerService(BaseService):
     # ------------------------------------------------------------- the walk
 
     @staticmethod
+    def _clock_grain(profile):
+        """The clock's grain, wherever the profile spells it.
+
+        `task.clock.grain` is the current form and `profile.time.grain` the
+        legacy one. Three branches of _keys_of used to read this, and the one
+        that mattered most read only the legacy spelling: a univariate forecast
+        has NO entity keys, so it fell past both task-form branches into the
+        tail, which looked at profile.time, found nothing, and emitted no bin:
+        key -- leaving a clock that nothing binned. Every single-series forecast
+        failed to compile.
+        """
+        clock = task_field(profile, "clock")
+        if isinstance(clock, dict) and clock.get("grain"):
+            return str(clock["grain"]).strip().lower()
+        return str((profile.get("time") or {}).get("grain") or "").strip().lower()
+
+    @staticmethod
     def _keys_of(profile, naming):
         """The profile's keys, as a list, in a fixed order.
 
@@ -417,9 +434,7 @@ class SpecCompilerService(BaseService):
                 out.append({
                     "name": (("k_" + n) if multi else "series_id") if naming == "v1" else n,
                     "from": n, "via": "", "origin": f"task.keys = {n}"})
-            grain = str((task_field(profile, "clock") or {}).get("grain")
-                        if isinstance(task_field(profile, "clock"), dict)
-                        else (profile.get("time") or {}).get("grain") or "").strip().lower()
+            grain = SpecCompilerService._clock_grain(profile)
             if grain:
                 out.append({"name": "t" if naming == "v1" else "period",
                             "from": "", "via": "bin:" + grain,
@@ -464,8 +479,7 @@ class SpecCompilerService(BaseService):
             out.append({"name": "series_id" if naming == "v1" else series,
                         "from": series, "via": "",
                         "origin": f"profile.x-deep.series = {series}"})
-        time = profile.get("time") or {}
-        grain = str(time.get("grain") or "").strip().lower()
+        grain = SpecCompilerService._clock_grain(profile)
         if grain:
             out.append({"name": "t" if naming == "v1" else "period",
                         "from": "", "via": "bin:" + grain,

@@ -444,8 +444,25 @@ function csvCell(v) {
 function targetColumn() {
   const r = LAST || {};
   const prof = r.profile || {}, bind = (r.binding || {}).bind || {};
-  const t = (prof.metrics || []).find(m => m.role === 'target');
-  if (t && t.measure) return bind[t.measure] || t.measure;
+  const task = prof.task || {};
+
+  // The task names WHICH METRIC is predicted — `label` for a categorical
+  // question, `target` for a numeric one — and the metric then names the
+  // logical measure, which the binding maps to a physical column. Three hops.
+  //
+  // An older profile carried `role: "target"` on the metric itself; that field
+  // is gone, and reading only it made this return null on every current
+  // profile, so the button reported "run the pipeline once first" after a
+  // perfectly good run.
+  const named = [].concat(task.label || [], task.target || [])
+                  .map(x => (x && x.metric) ? x.metric : x)
+                  .filter(Boolean);
+  for (const n of named) {
+    const m = (prof.metrics || []).find(x => x.name === n);
+    if (m && m.measure) return bind[m.measure] || m.measure;
+  }
+  const legacy = (prof.metrics || []).find(m => m.role === 'target');
+  if (legacy && legacy.measure) return bind[legacy.measure] || legacy.measure;
   return null;
 }
 
