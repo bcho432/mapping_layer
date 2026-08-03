@@ -113,6 +113,10 @@ SC = importlib.import_module("spl.services.spec_compiler.spec_compiler")
 ML = importlib.import_module("spl.services.mapping_layer.mapping_layer")
 EA = importlib.import_module("spl.services.engine_adapter.engine_adapter")
 FL = importlib.import_module("spl.services.mapping_layer.function_library")
+# The engines the model may choose from come from the same table the compiler
+# validates against, so the prompt cannot describe a pipeline that no longer
+# exists — or miss one that now does.
+TL = importlib.import_module("spl.services.spec_compiler.task_library")
 import llm_profile  # bench-side only: the services stay stdlib-only
 
 profile_generator = PG.ProfileGeneratorService()
@@ -214,7 +218,7 @@ def run(payload):
         if goal.strip() and use_llm:
             def enrich():
                 prof, rep = llm_profile.enrich(
-                    draft, schema, goal, FL.catalog(),
+                    draft, schema, goal, FL.catalog(), TL.catalog(),
                     binding_stub=binding)
                 return prof, rep
             enriched = step("llm", "llm (read the goal)", enrich)
@@ -349,6 +353,21 @@ class Handler(BaseHTTPRequestHandler):
                     "total": len(checks),
                     "failed": [k for k, v in checks.items() if not v],
                 }
+            # The LLM stage is bench-side, so it is not a service — but it is
+            # the one stage that can rewrite the whole profile, and it was the
+            # only one with no tests at all. Its offline half runs here, with
+            # the two stages below it wired in, so an accepted reply is proved
+            # to survive them rather than assumed to.
+            r = llm_profile.self_test(
+                TL.catalog(), FL.catalog(),
+                finalize=profile_generator._finalize,
+                compile_fn=spec_compiler._compile)
+            checks = r.get("checks", {})
+            out["llm-profile"] = {
+                "passed": sum(1 for v in checks.values() if v),
+                "total": len(checks),
+                "failed": [k for k, v in checks.items() if not v],
+            }
             return self._send(200, json.dumps(out))
         return self._send(404, json.dumps({"error": "not found"}))
 

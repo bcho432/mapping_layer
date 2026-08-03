@@ -23,7 +23,7 @@ needs `pydantic-settings`, so the four classes the services actually touch are
 stubbed; `spl.services` is mapped at `./services`, which keeps each service's own
 `function_library` / `derive_library` copy separate exactly as in production.
 
-The badge in the top right runs every service's self-tests on load (247 checks).
+The badge in the top right runs every service's self-tests on load (277 checks).
 If it is red, the services are broken, not the lab.
 
 ## The profile is a core and a task
@@ -74,12 +74,28 @@ A field a kind has no concept of is an **error**, not a silently ignored hint �
 otherwise every engine would have to know to skip it, and nothing would catch a
 recommender that set a grain by mistake.
 
-**The kind comes from the goal text**, by deterministic regex in a fixed order,
-in front of the language model. Even a total LLM outage still produces a
-correctly-shaped task. A kind that *requires* a clock always gets one; a kind
-that merely *permits* one gets it only if the goal asks for time — otherwise
-"segment customers" would quietly become "segment customers per month", which is
-a different question.
+**The kind comes from the goal text, and the model reads it.** The engine table
+above is generated into the prompt from `task_library` rather than written out
+in prose, so the model is never offered an engine that no longer exists or
+denied one that now does — adding a row reaches the model in the same commit it
+reaches the compiler.
+
+Behind it, the keyword scaffold still picks a kind by deterministic regex in a
+fixed order. That is the **fallback**, not the reading: no key, no network, a
+refusal, malformed JSON, a hallucinated column, a function outside the catalog —
+every one of those returns the deterministic draft with the reason recorded. The
+bench works with no API key at all; the model makes it better, never
+load-bearing.
+
+The difference shows on any goal the keywords cannot read. *"Which customers are
+about to stop ordering"* scores `forecast` on the regexes — there is no
+classification keyword in it — and is a `classify` to anything that reads the
+sentence.
+
+A kind that *requires* a clock always gets one; a kind that merely *permits* one
+gets it only if the goal asks for time — otherwise "segment customers" would
+quietly become "segment customers per month", which is a different question.
+That rule is enforced on the model's reply too, from the same table.
 
 **A flat profile still compiles.** One carrying `time` / `x-deep` /
 `metrics[].role` / `availability` is lifted into a task on the way in and

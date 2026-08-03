@@ -108,7 +108,7 @@
 <h1>The core and the task</h1>
 <p class="sub">What <code>main</code> adds on top of <code>master</code>, why each piece is
 there, and what was deliberately left alone.</p>
-<p class="kicker">3 August 2026 &middot; main = master@6573b7f + this &middot; 247 self-tests green</p>
+<p class="kicker">3 August 2026 &middot; main = master@6573b7f + this &middot; 277 self-tests green</p>
 
 <div class="legend">
   <span><b class="chip c-add">added</b> new on main</span>
@@ -121,11 +121,12 @@ there, and what was deliberately left alone.</p>
   <b class="t">read this first</b>
   <p><code>main</code> is not a competing implementation. It is <code>master</code> as of
   <code>6573b7f</code> — every line of it — plus the pieces of the v6 architecture that
-  master did not yet have. <code>mapping_layer.py</code>, <code>app.html</code>,
-  <code>server.py</code> and <code>engine_adapter/</code> are byte-for-byte master's.</p>
-  <p>Three files differ: <code>spec_compiler.py</code>, <code>profile_generator.py</code>,
-  <code>README.md</code>. One file is new: <code>task_library.py</code>, shipped into both
-  service packages the way <code>function_library</code> already is.</p>
+  master did not yet have. <code>mapping_layer.py</code>, <code>app.html</code> and
+  <code>engine_adapter/</code> are byte-for-byte master's.</p>
+  <p>Five files differ: <code>spec_compiler.py</code>, <code>profile_generator.py</code>,
+  <code>llm_profile.py</code>, <code>server.py</code>, <code>README.md</code>. One file is
+  new: <code>task_library.py</code>, shipped into both service packages the way
+  <code>function_library</code> already is.</p>
   <p><strong>Every profile master can compile produces a byte-identical SPEC.</strong> That
   was checked against master's own compiler rather than assumed — see
   <a href="#verify">verification</a>.</p>
@@ -360,8 +361,42 @@ plan, kind, pointer, pointed = task_library.check(task, metric_names)
 <div class="stage">
 <p class="stage-tag">4 &middot; the front of the pipeline</p>
 <h2>The goal text picks the question — all seven of them</h2>
-<p class="lede">Deterministic regex, checked in a fixed order, in front of the language
-model. Even a total LLM outage still produces a correctly-shaped task.</p>
+<p class="lede">The model reads the sentence and chooses the engine. A keyword scaffold
+picks one too, in a fixed order, and that is the fallback — so an outage still produces a
+correctly-shaped task.</p>
+
+<div class="box svc">
+  <h3>the engine table is generated into the prompt <span class="chip c-add">added</span></h3>
+  <p class="what">From <code>task_library</code>, never written out by hand.</p>
+<pre class="tight"><span class="cmt">// what the model is shown, verbatim</span>
+ENGINES (the only questions that can be asked; pick exactly one)
+  classify
+      Predict a categorical label per entity
+      requires: label, keys
+      accepts:  clock, covariates
+      keys:     1-4
+  <span class="cmt">… six more, straight off the catalog …</span></pre>
+  <details><summary>what this replaced, and why it mattered</summary><div class="d">
+    <p>The prompt used to carry the rules as prose: <em>"kind forecast and anomaly require
+    a time column; recommend, cluster, classify, regress and rank must not have one."</em>
+    By the time it was read, that was wrong against the catalog on three of the seven —
+    <code>classify</code>, <code>cluster</code> and <code>regress</code> all accept a clock —
+    and it spelled <code>detect_anomaly</code> as <code>anomaly</code>, which is not a value
+    the enum would accept.</p>
+    <p>The same three rules were hardcoded a second time in the reply validator, so a
+    correct answer from the model would have been rejected. Both now read the catalog.
+    Adding an engine reaches the model in the same commit it reaches the compiler.</p>
+  </div></details>
+</div>
+
+<div class="note" style="margin-top:1rem">
+  <b class="t">the model is never asked to learn three names for one idea</b>
+  <p>An engine's pointer is <code>target</code>, <code>signal</code> or <code>label</code>
+  depending on the row. The model marks what is predicted with role <code>target</code> and
+  everything else <code>feature</code>, and the lift renames it to whichever the kind uses —
+  the same path a legacy profile takes. One fewer thing to get wrong, and it reuses code
+  that was already tested.</p>
+</div>
 
 <div class="tw"><table>
   <thead><tr><th>goal</th><th>kind</th><th>who scaffolds it</th></tr></thead>
@@ -509,8 +544,9 @@ profile-generator   22  ->   78
 spec-compiler       52  ->   73
 mapping-layer       54  ->   54  <span class="cmt">untouched</span>
 engine-adapter      42  ->   42  <span class="cmt">untouched</span>
+llm-profile          0  ->   30  <span class="cmt">had none at all</span>
                    ---      ---
-                   170  ->  247   <span class="add">all green</span></pre>
+                   170  ->  277   <span class="add">all green</span></pre>
   </div>
   <div class="box">
     <h3>six goals, one schema, through every service</h3>
@@ -546,7 +582,7 @@ exactly as master designed it.</p>
 SitScape internal &middot; the core/task split &middot; 3 August 2026<br>
 main = master@6573b7f + task_library + the full task vocabulary + seven-kind triage<br>
 companion to pipeline-flowchart-v6.html (the architecture) and docs/spec-reference.html (the SPEC)<br>
-services: profile_generator 78 checks &middot; spec_compiler 73 &middot; mapping_layer 54 &middot; engine_adapter 42 &mdash; 247 green
+profile_generator 78 &middot; spec_compiler 73 &middot; mapping_layer 54 &middot; engine_adapter 42 &middot; llm_profile 30 &mdash; 277 green
 </footer>
 
 </div>
